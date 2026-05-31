@@ -3,7 +3,7 @@
 import dynamic from "next/dynamic";
 import { useState, useEffect } from "react";
 import { useWallet, useConnection } from "@solana/wallet-adapter-react";
-import { LAMPORTS_PER_SOL } from "@solana/web3.js";
+import { LAMPORTS_PER_SOL, Transaction, SystemProgram, PublicKey } from "@solana/web3.js";
 import { supabase } from "../../utils/supabase";
 import bs58 from "bs58";
 import { Activity, Key, Trash2, AlertTriangle, Copy, Check, Eye, EyeOff, Wallet, Zap, Hash, Clock, XCircle, Timer, Percent, Lock, Coins, ShieldCheck, ShoppingCart, ArrowRight, Tags, ArrowRightLeft } from "lucide-react";
@@ -51,7 +51,7 @@ const getElapsedTime = (createdAt: string) => {
 
 export default function VaultView() {
   const { connection } = useConnection();
-  const { connected, publicKey, signMessage } = useWallet();
+  const { connected, publicKey, signMessage, sendTransaction } = useWallet();
   const [balance, setBalance] = useState<number | null>(null);
   
   const [activeJobs, setActiveJobs] = useState<any[]>([]);
@@ -303,7 +303,10 @@ export default function VaultView() {
   };
 
   const submitListing = async (key: any) => {
-    if (!publicKey) return;
+    if (!publicKey || !sendTransaction) {
+      alert("Wallet not fully connected.");
+      return;
+    }
     setIsListing(true);
 
     try {
@@ -312,6 +315,31 @@ export default function VaultView() {
         throw new Error("Please enter a valid price greater than 0.");
       }
 
+      const adminWalletStr = process.env.NEXT_PUBLIC_ADMIN_WALLET;
+      if (!adminWalletStr) {
+        throw new Error("Admin wallet not configured. Cannot process listing fee.");
+      }
+
+      // 1. Charge the 0.025 SOL listing fee directly through the user's wallet
+      const transaction = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: publicKey,
+          toPubkey: new PublicKey(adminWalletStr),
+          lamports: 0.025 * LAMPORTS_PER_SOL,
+        })
+      );
+
+      const {
+        context: { slot: minContextSlot },
+        value: { blockhash, lastValidBlockHeight }
+      } = await connection.getLatestBlockhashAndContext();
+
+      const signature = await sendTransaction(transaction, connection, { minContextSlot });
+
+      // Await network confirmation before sending the payload to the backend
+      await connection.confirmTransaction({ blockhash, lastValidBlockHeight, signature });
+
+      // 2. Submit the verified payload to the backend
       const response = await fetch('/api/exchange/list', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -319,7 +347,8 @@ export default function VaultView() {
           jobId: key.id,
           userWallet: publicKey.toBase58(),
           rawPrivateKey: key.privateKey,
-          priceSol: priceNum
+          priceSol: priceNum,
+          paymentSignature: signature // Submitting the required hash!
         })
       });
 
@@ -332,6 +361,7 @@ export default function VaultView() {
       setCompletedKeys(completedKeys.filter(k => k.id !== key.id)); 
       setListingJobId(null);
     } catch (error: any) {
+      console.error(error);
       alert(error.message);
     } finally {
       setIsListing(false);
