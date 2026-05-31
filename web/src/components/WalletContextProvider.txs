@@ -1,0 +1,25 @@
+"use client";
+
+import { FC, ReactNode, useMemo } from "react";
+import { ConnectionProvider, WalletProvider } from "@solana/wallet-adapter-react";
+import { WalletModalProvider } from "@solana/wallet-adapter-react-ui";
+import { SolflareWalletAdapter } from "@solana/wallet-adapter-wallets";
+import { clusterApiUrl } from "@solana/web3.js";
+
+export const WalletContextProvider: FC<{ children: ReactNode }> = ({ children }) => {
+    // Connect to Solana Mainnet
+    const network = clusterApiUrl("mainnet-beta");
+    
+    // Phantom is now auto-detected, so we only need to manually load Solflare
+    const wallets = useMemo(() => [
+        new SolflareWalletAdapter()
+    ], []);
+
+    return (
+        <ConnectionProvider endpoint={network}>
+            <WalletProvider wallets={wallets} autoConnect>
+                <WalletModalProvider>{children}</WalletModalProvider>
+            </WalletProvider>
+        </ConnectionProvider>
+    );
+};
