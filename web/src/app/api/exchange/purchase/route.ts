@@ -3,15 +3,20 @@ import { createClient } from '@supabase/supabase-js';
 import nacl from 'tweetnacl';
 import util from 'tweetnacl-util';
 import sealedBox from 'tweetnacl-sealedbox-js';
-import { Connection } from '@solana/web3.js';
+import { Connection, LAMPORTS_PER_SOL } from '@solana/web3.js';
 
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_KEY!);
-
-// Explicitly set connection commitment to 'confirmed'
 const connection = new Connection(process.env.NEXT_PUBLIC_SOLANA_RPC_URL || "https://api.devnet.solana.com", "confirmed");
+
+// The wallet where the 5% platform fee should go
+const PLATFORM_FEE_WALLET = process.env.NEXT_PUBLIC_ADMIN_WALLET;
 
 export async function POST(req: Request) {
   try {
+    if (!PLATFORM_FEE_WALLET) {
+      return NextResponse.json({ error: 'Server misconfiguration: Missing Admin Wallet.' }, { status: 500 });
+    }
+
     const { signature, buyerWallet, sellerWallet, itemId, priceSol, clientPubkey } = await req.json();
 
     if (!signature || !buyerWallet || !itemId || !clientPubkey) {
@@ -41,8 +46,8 @@ export async function POST(req: Request) {
     console.log("Waiting 5 seconds for Solana RPC to sync the exchange transaction...");
     await new Promise(resolve => setTimeout(resolve, 5000));
     
-    // Demand the 'confirmed' version of the transaction so it doesn't wait 30 seconds for 'finalized'
-    const tx = await connection.getTransaction(signature, {
+    // Fetch the parsed transaction to read the transfer instructions
+    const tx = await connection.getParsedTransaction(signature, {
       maxSupportedTransactionVersion: 0,
       commitment: 'confirmed'
     });
@@ -55,9 +60,41 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Transaction failed on-chain' }, { status: 400 });
     }
 
+    // --- NEW SECURITY CHECK: Verify the 95% Seller Payout and 5% Admin Fee ---
+    const totalLamports = Math.round(priceSol * LAMPORTS_PER_SOL);
+    const expectedFee = Math.round(totalLamports * 0.05);
+    const expectedSellerPayout = totalLamports - expectedFee;
+
+    let sellerPaid = false;
+    let feePaid = false;
+
+    const messageInstructions = tx.transaction.message.instructions;
+
+    for (const inst of messageInstructions) {
+      if ('parsed' in inst && inst.program === 'system' && inst.parsed.type === 'transfer') {
+        const { destination, lamports, source } = inst.parsed.info;
+
+        // Ensure the buyer is the one sending the money
+        if (source === buyerWallet) {
+          // Check if seller got exactly 95%
+          if (destination === sellerWallet && lamports === expectedSellerPayout) {
+            sellerPaid = true;
+          }
+          // Check if admin got exactly 5%
+          if (destination === PLATFORM_FEE_WALLET && lamports === expectedFee) {
+            feePaid = true;
+          }
+        }
+      }
+    }
+
+    if (!sellerPaid || !feePaid) {
+      console.error("Payment Verification Failed. Expected transfers missing.");
+      return NextResponse.json({ error: 'Fraud detected: Transaction amounts or destinations are invalid.' }, { status: 400 });
+    }
+    // --------------------------------------------------------------------------
+
     // 3. THE HANDOVER: Decrypt Master Payload and Re-Encrypt for Buyer
-    
-    // Parse the Key Dictionary from the environment
     const keysEnv = process.env.MASTER_KEYS || `v1:${process.env.MASTER_INVENTORY_KEY}`;
     const masterKeyDict = Object.fromEntries(keysEnv.split(',').map(k => k.split(':')));
 
@@ -65,7 +102,6 @@ export async function POST(req: Request) {
     let version = 'v1';
     let ciphertextBase64 = rawPayload;
 
-    // Check if this payload was encrypted using the new versioning system
     if (rawPayload.includes(':')) {
       [version, ciphertextBase64] = rawPayload.split(':');
     }
@@ -75,7 +111,6 @@ export async function POST(req: Request) {
       throw new Error(`CRITICAL: Missing historical master key for version ${version}`);
     }
 
-    // Proceed with decryption using the mathematically correct historical key
     const masterKeyBytes = util.decodeBase64(masterKeyString);
     const escrowBytes = util.decodeBase64(ciphertextBase64);
     
@@ -94,11 +129,11 @@ export async function POST(req: Request) {
 
     // 5. Transfer Ownership in Database
     await supabase.from('vanity_jobs').update({
-      customer_wallet: buyerWallet, // Transfer ownership!
+      customer_wallet: buyerWallet,
       is_listed: false,
       listing_price: 0,
       escrow_payload: null,
-      result_payload: safeEncryptedPayload // Give them the newly encrypted key
+      result_payload: safeEncryptedPayload
     }).eq('id', itemId);
 
     return NextResponse.json({ success: true });
