@@ -1,6 +1,6 @@
 "use client";
 
-import { Shield, EyeOff, Trash2, Github, HelpCircle } from "lucide-react";
+import { Shield, EyeOff, Trash2, HelpCircle } from "lucide-react";
 
 export default function SecuritySection() {
   return (
@@ -89,14 +89,14 @@ export default function SecuritySection() {
             target="_blank" 
             className="flex items-center justify-center gap-2 px-6 py-3 bg-foreground text-background font-bold text-sm rounded-lg hover:scale-[1.02] active:scale-[0.98] transition-all"
           >
-            <Github size={16} /> Inspect Web Frontend Repo
+            <img src="/github-icon.svg" className="w-4 h-4 invert dark:invert-0" alt="" /> Inspect Web Frontend Repo
           </a>
           <a 
             href="https://github.com/solanakeys/solanakeys-worker" 
             target="_blank" 
             className="flex items-center justify-center gap-2 px-6 py-3 bg-card border border-card-border font-bold text-sm rounded-lg hover:scale-[1.02] active:scale-[0.98] transition-all text-foreground hover:bg-zinc-50 dark:hover:bg-zinc-900/50"
           >
-            <Github size={16} /> Inspect CUDA Core Worker Repo
+            <img src="/github-icon.svg" className="w-4 h-4 dark:invert" alt="" /> Inspect CUDA Core Worker Repo
           </a>
         </div>
       </div>
