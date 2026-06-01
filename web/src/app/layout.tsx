@@ -12,7 +12,21 @@ const geistMono = Geist_Mono({ variable: "--font-geist-mono", subsets: ["latin"]
 
 export const metadata: Metadata = {
   title: "SolanaKeys | GPU Vanity Generator",
-  description: "Distributed Hardware Vanity Address Generation Cluster",
+  description: "Instantly generate custom Solana wallets. Zero-knowledge E2EE encryption, blistering GPU hash rates, and fully stateless deterministic key delivery.",
+  metadataBase: new URL('https://solanakeys.com'),
+  openGraph: {
+    title: 'SolanaKeys | GPU Vanity Generator',
+    description: 'Instantly generate custom Solana wallets. Zero-knowledge E2EE encryption, blistering GPU hash rates, and fully stateless deterministic key delivery.',
+    url: 'https://solanakeys.com',
+    siteName: 'SolanaKeys',
+    locale: 'en_US',
+    type: 'website',
+  },
+  twitter: {
+    card: 'summary_large_image',
+    title: 'SolanaKeys | GPU Vanity Generator',
+    description: 'Generate cryptographically secure, custom Solana vanity addresses at bare-metal speeds.',
+  },
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
