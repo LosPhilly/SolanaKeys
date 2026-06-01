@@ -8,7 +8,7 @@ import {
   ShieldAlert, Trash2, Activity, Database, Lock, RefreshCcw, 
   LayoutDashboard, Store, ArrowRightLeft, Settings, Cpu, 
   DollarSign, Flame, Server, Key, History, Undo2, Users, 
-  TrendingUp, BarChart3, AlertCircle
+  TrendingUp, BarChart3, AlertCircle, Thermometer
 } from "lucide-react";
 
 export default function AdminView() {
@@ -20,6 +20,7 @@ export default function AdminView() {
   const [escrow, setEscrow] = useState<any[]>([]);
   const [completedJobs, setCompletedJobs] = useState<any[]>([]);
   const [activeJobsCount, setActiveJobsCount] = useState<number>(0);
+  const [workerTelemetry, setWorkerTelemetry] = useState<any[]>([]);
   
   // UI State
   const [loading, setLoading] = useState(true);
@@ -32,23 +33,44 @@ export default function AdminView() {
   useEffect(() => {
     if (isAuthorized) {
       fetchAllData();
+      
+      // Set up a quiet 3-second polling interval specifically for hardware telemetry updates
+      const telemetryInterval = setInterval(() => {
+        fetchHardwareTelemetry();
+      }, 3000);
+
+      return () => clearInterval(telemetryInterval);
     }
   }, [isAuthorized]);
+
+  const fetchHardwareTelemetry = async () => {
+    try {
+      const { data } = await supabase
+        .from('worker_telemetry')
+        .select('*')
+        .order('gpu_id', { ascending: true });
+      if (data) setWorkerTelemetry(data);
+    } catch (err) {
+      console.error("Failed to sync worker telemetry stream", err);
+    }
+  };
 
   const fetchAllData = async () => {
     setLoading(true);
     try {
-      const [invRes, escRes, histRes, jobsRes] = await Promise.all([
+      const [invRes, escRes, histRes, jobsRes, telRes] = await Promise.all([
         supabase.from('premium_inventory').select('*').order('created_at', { ascending: false }),
         supabase.from('vanity_jobs').select('*').eq('is_listed', true).order('created_at', { ascending: false }),
         supabase.from('vanity_jobs').select('*').in('status', ['COMPLETED', 'FAILED', 'REFUNDED']).order('completed_at', { ascending: false }).limit(100),
-        supabase.from('vanity_jobs').select('id', { count: 'exact' }).eq('status', 'PROCESSING')
+        supabase.from('vanity_jobs').select('id', { count: 'exact' }).eq('status', 'PROCESSING'),
+        supabase.from('worker_telemetry').select('*').order('gpu_id', { ascending: true })
       ]);
 
       if (invRes.data) setInventory(invRes.data);
       if (escRes.data) setEscrow(escRes.data);
       if (histRes.data) setCompletedJobs(histRes.data);
       if (jobsRes.count !== null) setActiveJobsCount(jobsRes.count);
+      if (telRes.data) setWorkerTelemetry(telRes.data);
       
     } catch (err) {
       console.error("Failed to fetch admin data", err);
@@ -130,6 +152,7 @@ export default function AdminView() {
         lastValidBlockHeight
       }, 'confirmed');
 
+      // --- FORCE TYPE BYPASS VIA EXPLICIT CASTING ---
       const { error } = await (supabase as any)
         .from('vanity_jobs')
         .update({ status: 'REFUNDED' })
@@ -169,6 +192,10 @@ export default function AdminView() {
       ...escrow.map(e => e.customer_wallet)
     ]).size;
 
+    // Aggregate computational parameters from isolated worker threads
+    const totalClusterHashrate = workerTelemetry.reduce((sum, w) => sum + (Number(w.local_hashrate) || 0), 0);
+    const totalClusterAttempts = workerTelemetry.reduce((sum, w) => sum + (Number(w.local_attempts) || 0), 0);
+
     return {
       inventoryValue: totalInvValue.toFixed(2),
       escrowFees: (totalEscrowValue * 0.05).toFixed(2), 
@@ -176,9 +203,11 @@ export default function AdminView() {
       totalVolume: totalVolume.toFixed(2),
       successRate,
       uniqueUsers,
-      totalKeys: inventory.length + escrow.length
+      totalKeys: inventory.length + escrow.length,
+      clusterHashrate: (totalClusterHashrate / 1e6).toFixed(2), // Converts to Mh/s format cleanly
+      clusterAttempts: totalClusterAttempts.toLocaleString()
     };
-  }, [inventory, escrow, completedJobs]);
+  }, [inventory, escrow, completedJobs, workerTelemetry]);
 
   if (!isAuthorized) {
     return (
@@ -196,7 +225,6 @@ export default function AdminView() {
 
   return (
     <div className="text-foreground pb-24">
-      {/* ADDED max-w-7xl and w-full right here */}
       <div className="max-w-7xl mx-auto w-full space-y-8 animate-in fade-in duration-200">
         
         {/* ================= HEADER ================= */}
@@ -274,17 +302,61 @@ export default function AdminView() {
               </div>
             </div>
 
-            {/* Hardware & Network Telemetry */}
+            {/* REAL-TIME HARDWARE NODE MAP SUB-PANEL */}
             <div>
               <h3 className="text-sm font-bold text-zinc-500 uppercase tracking-wider mb-4 flex items-center gap-2">
-                <Cpu size={16}/> Silicon Array Telemetry
+                <Cpu size={16}/> Dynamic Silicon Matrix Cluster
+              </h3>
+              <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                {[0, 1, 2, 3].map((gpuIdx) => {
+                  const telemetryNode = workerTelemetry.find(w => w.gpu_id === gpuIdx);
+                  const nodeSpeed = telemetryNode ? (Number(telemetryNode.local_hashrate) / 1e6).toFixed(2) : "0.00";
+                  const nodeHashes = telemetryNode ? Number(telemetryNode.local_attempts).toLocaleString() : "0";
+                  const nodeActive = telemetryNode && (new Date().getTime() - new Date(telemetryNode.updated_at).getTime() < 12000);
+
+                  return (
+                    <div key={gpuIdx} className="bg-card border border-card-border p-5 rounded-xl shadow-sm space-y-4 hover:border-purple-500/30 transition-all">
+                      <div className="flex justify-between items-center">
+                        <div className="flex items-center gap-2">
+                          <Cpu size={18} className={nodeActive ? "text-purple-500 animate-pulse" : "text-zinc-400"} />
+                          <span className="text-sm font-black font-mono">GPU NODE #{gpuIdx}</span>
+                        </div>
+                        <span className={`w-2 h-2 rounded-full ${nodeActive ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.5)]' : 'bg-zinc-300'}`} />
+                      </div>
+                      
+                      <div className="space-y-1.5 font-mono text-xs">
+                        <div className="flex justify-between">
+                          <span className="text-zinc-400">Node Speed:</span>
+                          <span className="font-bold text-foreground">{nodeSpeed} Mh/s</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-zinc-400">Node Volume:</span>
+                          <span className="text-zinc-500 truncate max-w-[120px]">{nodeHashes}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-zinc-400">Status Map:</span>
+                          <span className={nodeActive ? "text-green-500 font-semibold" : "text-zinc-400"}>
+                            {nodeActive ? "COMPUTING" : "STANDBY"}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Hardware & Network Telemetry Overview */}
+            <div>
+              <h3 className="text-sm font-bold text-zinc-500 uppercase tracking-wider mb-4 flex items-center gap-2">
+                <Activity size={16}/> Silicon Array Aggregate Overviews
               </h3>
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                 <div className="bg-card border border-card-border p-6 rounded-xl flex items-center gap-4 shadow-sm">
                    <div className="bg-background p-3 rounded-lg border border-card-border text-foreground"><Cpu size={24}/></div>
                    <div>
-                     <p className="text-xs text-zinc-500 font-bold uppercase tracking-wider mb-0.5">Active Hardware</p>
-                     <h4 className="text-lg font-mono text-foreground font-semibold">5x NVIDIA RTX</h4>
+                     <p className="text-xs text-zinc-500 font-bold uppercase tracking-wider mb-0.5">Cluster Core Velocity</p>
+                     <h4 className="text-lg font-mono text-foreground font-semibold">{stats.clusterHashrate} Mh/s Total</h4>
                    </div>
                 </div>
                 <div className="bg-card border border-card-border p-6 rounded-xl flex items-center gap-4 shadow-sm">
@@ -468,7 +540,7 @@ export default function AdminView() {
                     <span className="text-green-700 dark:text-green-400 font-bold bg-green-50 dark:bg-green-500/10 px-2 py-0.5 rounded border border-green-200 dark:border-green-500/20">v1</span>
                   </div>
                   <div className="flex justify-between pt-1">
-                    <span className="text-zinc-500">MASTER_KEYS Loaded</span>
+                    <span className="text-zinc-500">MASTER_KEYS_ENV Loaded</span>
                     <span className="text-foreground font-medium">1 Version</span>
                   </div>
                 </div>

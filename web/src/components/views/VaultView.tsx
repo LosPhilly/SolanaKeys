@@ -6,7 +6,7 @@ import { useWallet, useConnection } from "@solana/wallet-adapter-react";
 import { LAMPORTS_PER_SOL, Transaction, SystemProgram, PublicKey } from "@solana/web3.js";
 import { supabase } from "../../utils/supabase";
 import bs58 from "bs58";
-import { Activity, Key, Trash2, AlertTriangle, Copy, Check, Eye, EyeOff, Wallet, Zap, Hash, Clock, XCircle, Timer, Percent, Lock, Coins, ShieldCheck, ShoppingCart, ArrowRight, Tags, ArrowRightLeft } from "lucide-react";
+import { Activity, Key, Trash2, AlertTriangle, Copy, Check, Eye, EyeOff, Wallet, Zap, Hash, Clock, XCircle, Timer, Percent, Lock, Coins, ShieldCheck, ShoppingCart, ArrowRight, Tags, ArrowRightLeft, Info } from "lucide-react";
 
 import nacl from "tweetnacl";
 import util from "tweetnacl-util";
@@ -320,7 +320,6 @@ export default function VaultView() {
         throw new Error("Admin wallet not configured. Cannot process listing fee.");
       }
 
-      // 1. Charge the 0.025 SOL listing fee directly through the user's wallet
       const transaction = new Transaction().add(
         SystemProgram.transfer({
           fromPubkey: publicKey,
@@ -335,11 +334,8 @@ export default function VaultView() {
       } = await connection.getLatestBlockhashAndContext();
 
       const signature = await sendTransaction(transaction, connection, { minContextSlot });
-
-      // Await network confirmation before sending the payload to the backend
       await connection.confirmTransaction({ blockhash, lastValidBlockHeight, signature });
 
-      // 2. Submit the verified payload to the backend
       const response = await fetch('/api/exchange/list', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -348,7 +344,7 @@ export default function VaultView() {
           userWallet: publicKey.toBase58(),
           rawPrivateKey: key.privateKey,
           priceSol: priceNum,
-          paymentSignature: signature // Submitting the required hash!
+          paymentSignature: signature 
         })
       });
 
@@ -407,21 +403,57 @@ export default function VaultView() {
     }
   };
 
+  // -----------------------------------------------------
+  // NEW: SECURE CANCELLATION API CALL WITH REFUNDS
+  // -----------------------------------------------------
   const cancelJob = async (id: string) => {
+    if (!publicKey || !signMessage) {
+      alert("Wallet not connected or does not support signing.");
+      return;
+    }
+
     const warningMessage = 
-      "⚠️ WARNING: Are you sure you want to cancel this generation?\n\n" +
-      "The SOL used to pay for this computational task is NON-REFUNDABLE and will be permanently lost if you proceed.\n\n" +
-      "Click 'OK' to abort and forfeit the fee, or 'Cancel' to let the workers finish.";
+      "⚠️ CANCEL GENERATION\n\n" +
+      "Are you sure you want to abort this compute task?\n" +
+      "You will receive an automated refund less a 2% network/compute fee.\n\n" +
+      "Click 'OK' to securely sign the cancellation request.";
       
     if (!window.confirm(warningMessage)) return;
 
-    const { error } = await (supabase.from('vanity_jobs') as any)
-      .update({ status: 'FAILED', result_payload: 'CANCELLED_BY_USER' })
-      .eq('id', id);
+    try {
+      // 1. Prompt user to sign the cancellation request to prove ownership
+      const messageStr = `Authenticate to SolanaKeys.\nAction: CANCEL_AND_REFUND\nJob ID: ${id}`;
+      const messageBytes = new TextEncoder().encode(messageStr);
 
-    if (error) {
-      console.error("Failed to cancel job:", error);
-      alert("Failed to cancel the job. Please try again.");
+      const signatureBytes = await signMessage(messageBytes);
+      const signatureBase58 = bs58.encode(signatureBytes);
+
+      // 2. Send the verified request to the backend API
+      const response = await fetch('/api/jobs/cancel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jobId: id,
+          userWallet: publicKey.toBase58(),
+          message: messageStr,
+          signature: signatureBase58
+        })
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || "Failed to process cancellation.");
+      }
+      
+      alert(`Job cancelled successfully! A refund of ${data.refundAmount?.toFixed(4) || 0} SOL has been routed back to your wallet.`);
+      
+      // Update local UI state to remove the cancelled job
+      setActiveJobs(activeJobs.filter(job => job.id !== id));
+
+    } catch (error: any) {
+      console.error("Cancellation error:", error);
+      alert(error.message || "An unexpected error occurred during cancellation.");
     }
   };
 
@@ -523,83 +555,113 @@ export default function VaultView() {
             <p className="font-bold">You have no active generation jobs running.</p>
           </div>
         ) : (
-          activeJobs.map((job: any) => (
-            <div key={job.id} className="p-6 md:p-8 bg-background m-4 border border-card-border rounded-xl space-y-4 relative overflow-hidden transition-all duration-300 shadow-sm hover:shadow-md">
-              <div className={`absolute top-0 left-0 w-1.5 h-full ${job.status === 'PENDING' ? 'bg-amber-500' : 'bg-blue-500 animate-pulse'}`}></div>
-              
-              <div className={`flex flex-col sm:flex-row sm:justify-between sm:items-center font-bold mb-6 border-b border-card-border/50 pb-5 gap-4 ${job.status === 'PENDING' ? 'text-amber-600 dark:text-amber-400' : 'text-blue-600 dark:text-blue-400'}`}>
-                {job.status === 'PENDING' ? (
-                  <span className="flex items-center gap-2 text-sm tracking-widest uppercase">
-                    <Clock size={18} /> 
-                    WAITING IN QUEUE <span className="opacity-70">(Pos: #{queuePositions[job.id] || '...'})</span>
-                  </span>
-                ) : (
-                  <span className="flex items-center gap-2 text-sm tracking-widest uppercase">
-                    <Activity size={18} className="animate-pulse" /> 
-                    {job.status === 'STARTING' ? 'INITIALIZING WORKERS...' : 'GENERATION IN PROGRESS'}
-                  </span>
-                )}
+          activeJobs.map((job: any) => {
+            const elapsedMinutes = (Date.now() - new Date(job.created_at || Date.now()).getTime()) / 60000;
+            const isProRated = elapsedMinutes > 60;
+            const basePrice = job.price_sol || 0; 
+            const estimatedRefund = isProRated 
+              ? Math.max(0, basePrice * (0.98 - ((elapsedMinutes / 60) * 0.10)))
+              : basePrice * 0.98;
 
-                <div className="flex items-center gap-4">
-                  <span className="text-xs text-zinc-500 font-medium">
-                    {new Date(job.created_at || Date.now()).toLocaleString()}
-                  </span>
-                  <button 
-                    onClick={() => cancelJob(job.id)}
-                    className="text-zinc-500 hover:text-red-500 bg-card hover:bg-red-50 dark:hover:bg-red-500/10 border border-card-border transition-colors px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-xs font-bold uppercase tracking-wider active:scale-95"
-                    title="Abort Task"
-                  >
-                    <XCircle size={14} /> Cancel
-                  </button>
+            return (
+              <div key={job.id} className="p-6 md:p-8 bg-background m-4 border border-card-border rounded-xl space-y-4 relative overflow-hidden transition-all duration-300 shadow-sm hover:shadow-md">
+                <div className={`absolute top-0 left-0 w-1.5 h-full ${job.status === 'PENDING' ? 'bg-amber-500' : 'bg-blue-500 animate-pulse'}`}></div>
+                
+                <div className={`flex flex-col sm:flex-row sm:justify-between sm:items-start font-bold mb-6 border-b border-card-border/50 pb-5 gap-4 ${job.status === 'PENDING' ? 'text-amber-600 dark:text-amber-400' : 'text-blue-600 dark:text-blue-400'}`}>
+                  {job.status === 'PENDING' ? (
+                    <span className="flex items-center gap-2 text-sm tracking-widest uppercase">
+                      <Clock size={18} /> 
+                      WAITING IN QUEUE <span className="opacity-70">(Pos: #{queuePositions[job.id] || '...'})</span>
+                    </span>
+                  ) : (
+                    <span className="flex items-center gap-2 text-sm tracking-widest uppercase">
+                      <Activity size={18} className="animate-pulse" /> 
+                      {job.status === 'STARTING' ? 'INITIALIZING WORKERS...' : 'GENERATION IN PROGRESS'}
+                    </span>
+                  )}
+
+                  <div className="flex flex-col items-end gap-1">
+                    <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold bg-green-500/10 text-green-600 dark:text-green-400 border border-green-500/20">
+                      <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span>
+                      {isProRated ? "Pro-rated Refund Active" : "98% Refund Guarantee"}
+                    </span>
+                    <span className="text-xs text-zinc-500 font-medium mt-1">
+                      Started: {new Date(job.created_at || Date.now()).toLocaleString()}
+                    </span>
+                  </div>
+                </div>
+                
+                <div className="grid grid-cols-2 md:grid-cols-6 gap-6 text-sm">
+                  <div>
+                    <span className="text-zinc-500 block text-[10px] font-bold uppercase tracking-widest mb-1.5">Target Pattern</span>
+                    <span className="font-black font-mono text-lg text-foreground">
+                      {formatTargetPattern(job.prefix, job.suffix)}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-zinc-500 block text-[10px] font-bold uppercase tracking-widest mb-1.5 flex items-center gap-1"><Hash size={12}/> Keys Checked</span>
+                    <span className="font-bold text-foreground text-base">
+                      {job.attempts ? job.attempts.toLocaleString() : '0'}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-zinc-500 block text-[10px] font-bold uppercase tracking-widest mb-1.5 flex items-center gap-1"><Zap size={12}/> Live Hashrate</span>
+                    <span className={`font-bold text-base ${job.status === 'PENDING' ? 'text-zinc-400' : 'text-amber-600 dark:text-amber-500'}`}>
+                      {job.status === 'PENDING' ? 'Waiting...' : job.hashrate ? `${(job.hashrate / 1000).toFixed(1)} kH/s` : 'Calculating...'}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-zinc-500 block text-[10px] font-bold uppercase tracking-widest mb-1.5 flex items-center gap-1"><Timer size={12}/> Elapsed Time</span>
+                    <span className={`font-bold text-base ${job.status === 'PENDING' ? 'text-zinc-400' : 'text-foreground'}`}>
+                      {job.status === 'PENDING' ? 'Waiting...' : getElapsedTime(job.created_at)}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-zinc-500 block text-[10px] font-bold uppercase tracking-widest mb-1.5 flex items-center gap-1"><Percent size={12}/> Probability</span>
+                    <span className={`font-bold text-base ${job.status === 'PENDING' ? 'text-zinc-400' : 'text-emerald-600 dark:text-emerald-400'}`}>
+                      {job.status === 'PENDING' ? 'Waiting...' : calculateProbability(job.target_length, job.attempts)}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-zinc-500 block text-[10px] font-bold uppercase tracking-widest mb-1.5">Status</span>
+                    <span className={`font-black uppercase tracking-wider text-sm inline-flex items-center gap-2 ${job.status === 'PENDING' ? 'text-amber-600 dark:text-amber-500' : 'text-purple-600 dark:text-purple-500'}`}>
+                      {job.status !== 'PENDING' && (
+                        <span className="relative flex h-2.5 w-2.5">
+                          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-purple-400 opacity-75"></span>
+                          <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-purple-500"></span>
+                        </span>
+                      )}
+                      {job.status}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Refund & Cancellation Action */}
+                <div className="mt-8 pt-6 border-t border-card-border/50 space-y-4">
+                  <div className="flex items-start gap-3 bg-blue-50 dark:bg-blue-500/5 p-4 rounded-xl border border-blue-100 dark:border-blue-500/10">
+                    <Info size={18} className="text-blue-500 shrink-0 mt-0.5" />
+                    <p className="text-xs text-zinc-600 dark:text-zinc-400 leading-relaxed">
+                      <strong className="text-blue-600 dark:text-blue-400 font-bold uppercase tracking-wider block mb-1">Compute taking too long?</strong>
+                      You can abort this task at any time. Your transaction will instantly cancel on-chain, and your computing deposit will be returned directly to your connected wallet.
+                    </p>
+                  </div>
+                  
+                  <div className="flex flex-col sm:flex-row items-center justify-between gap-4">
+                    <span className="text-sm font-bold text-zinc-500 dark:text-zinc-400 font-mono">
+                      Est. Return: <span className="text-foreground">{estimatedRefund.toFixed(4)} SOL</span>
+                    </span>
+                    
+                    <button 
+                      onClick={() => cancelJob(job.id)}
+                      className="w-full sm:w-auto bg-card hover:bg-red-50 dark:hover:bg-red-500/10 text-foreground hover:text-red-500 border border-card-border hover:border-red-500/30 px-6 py-3 rounded-lg text-sm font-black uppercase tracking-widest transition-all cursor-pointer shadow-sm active:scale-95 flex items-center justify-center gap-2"
+                    >
+                      <XCircle size={18} /> Abort Task & Claim Refund
+                    </button>
+                  </div>
                 </div>
               </div>
-              
-              <div className="grid grid-cols-2 md:grid-cols-6 gap-6 text-sm">
-                <div>
-                  <span className="text-zinc-500 block text-[10px] font-bold uppercase tracking-widest mb-1.5">Target Pattern</span>
-                  <span className="font-black font-mono text-lg text-foreground">
-                    {formatTargetPattern(job.prefix, job.suffix)}
-                  </span>
-                </div>
-                <div>
-                  <span className="text-zinc-500 block text-[10px] font-bold uppercase tracking-widest mb-1.5 flex items-center gap-1"><Hash size={12}/> Keys Checked</span>
-                  <span className="font-bold text-foreground text-base">
-                    {job.attempts ? job.attempts.toLocaleString() : '0'}
-                  </span>
-                </div>
-                <div>
-                  <span className="text-zinc-500 block text-[10px] font-bold uppercase tracking-widest mb-1.5 flex items-center gap-1"><Zap size={12}/> Live Hashrate</span>
-                  <span className={`font-bold text-base ${job.status === 'PENDING' ? 'text-zinc-400' : 'text-amber-600 dark:text-amber-500'}`}>
-                    {job.status === 'PENDING' ? 'Waiting...' : job.hashrate ? `${(job.hashrate / 1000).toFixed(1)} kH/s` : 'Calculating...'}
-                  </span>
-                </div>
-                <div>
-                  <span className="text-zinc-500 block text-[10px] font-bold uppercase tracking-widest mb-1.5 flex items-center gap-1"><Timer size={12}/> Elapsed Time</span>
-                  <span className={`font-bold text-base ${job.status === 'PENDING' ? 'text-zinc-400' : 'text-foreground'}`}>
-                    {job.status === 'PENDING' ? 'Waiting...' : getElapsedTime(job.created_at)}
-                  </span>
-                </div>
-                <div>
-                  <span className="text-zinc-500 block text-[10px] font-bold uppercase tracking-widest mb-1.5 flex items-center gap-1"><Percent size={12}/> Probability</span>
-                  <span className={`font-bold text-base ${job.status === 'PENDING' ? 'text-zinc-400' : 'text-emerald-600 dark:text-emerald-400'}`}>
-                    {job.status === 'PENDING' ? 'Waiting...' : calculateProbability(job.target_length, job.attempts)}
-                  </span>
-                </div>
-                <div>
-                  <span className="text-zinc-500 block text-[10px] font-bold uppercase tracking-widest mb-1.5">Status</span>
-                  <span className={`font-black uppercase tracking-wider text-sm inline-flex items-center gap-2 ${job.status === 'PENDING' ? 'text-amber-600 dark:text-amber-500' : 'text-purple-600 dark:text-purple-500'}`}>
-                    {job.status !== 'PENDING' && (
-                      <span className="relative flex h-2.5 w-2.5">
-                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-purple-400 opacity-75"></span>
-                        <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-purple-500"></span>
-                      </span>
-                    )}
-                    {job.status}
-                  </span>
-                </div>
-              </div>
-            </div>
-          ))
+            );
+          })
         )}
       </div>
 

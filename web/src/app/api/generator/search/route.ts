@@ -19,7 +19,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Server misconfiguration.' }, { status: 500 });
     }
 
-    const { signature, userWallet, prefix, suffix, priceSol, clientPubkey } = await req.json();
+    const { signature, userWallet, prefix, suffix, priceSol, clientPubkey, isSuperUserMode } = await req.json();
 
     if (!signature || !userWallet || (!prefix && !suffix) || priceSol === undefined) {
       return NextResponse.json({ error: 'Missing mandatory fields (Requires Signature, Wallet, Price, and Target)' }, { status: 400 });
@@ -29,12 +29,37 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Missing Zero-Knowledge Encryption Lock' }, { status: 400 });
     }
 
+    // --- HARD SERVER-SIDE VALIDATION & INPUT SANITIZATION ---
+    // Strict Base58 cleanup to derive accurate compute profiles
+    const cleanPrefix = (prefix || '').replace(/[^1-9A-HJ-NP-Za-km-z]/g, '');
+    const cleanSuffix = (suffix || '').replace(/[^1-9A-HJ-NP-Za-km-z]/g, '');
+    const combinedLength = cleanPrefix.length + cleanSuffix.length;
+
+    if (combinedLength === 0) {
+      return NextResponse.json({ error: 'Valid matching target length cannot be 0.' }, { status: 400 });
+    }
+
+    // Standard Retail Cap check
+    if (combinedLength > 5 && !isSuperUserMode) {
+      return NextResponse.json({ 
+        error: `Requested search parameters (${combinedLength} chars) exceed the standard 5-character limit. Please enable Super Search mode to scale compute hardware.` 
+      }, { status: 400 });
+    }
+
+    // Absolute Safety Infrastructure Ceiling (Prevents impossible calculations)
+    if (isSuperUserMode && combinedLength > 10) {
+      return NextResponse.json({ 
+        error: `Search phrase pattern (${combinedLength} chars) exceeds absolute limits for a 24-hour search window.` 
+      }, { status: 400 });
+    }
+    // --------------------------------------------------------
+
     const expectedLamports = Math.round(priceSol * 1_000_000_000);
 
     console.log(`Verifying GPU Cluster Fee: ${priceSol} SOL...`);
     await new Promise((resolve) => setTimeout(resolve, 5000)); // Initial blockchain propagation wait
 
-    // --- NEW: Resilient RPC Retry Loop ---
+    // --- Resilient RPC Retry Loop ---
     let tx = null;
     let retries = 3;
     
@@ -85,21 +110,22 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Payment details audit mismatch' }, { status: 400 });
     }
 
-    console.log("✅ Custom Generation Payment Verified! Routing to GPU Cluster...");
+    console.log(`✅ Custom Generation Payment Verified! Routing to GPU Cluster [Super Search: ${!!isSuperUserMode}]`);
 
-    const targetLength = (prefix?.length || 0) + (suffix?.length || 0);
-
+    // Write parameters cleanly using existing schemas without schema updates
     const { error: insertError } = await supabase
       .from('vanity_jobs')
       .insert({
         customer_wallet: userWallet,
-        prefix: prefix || null,
-        suffix: suffix || null,
-        target_length: targetLength,
+        prefix: cleanPrefix || null,
+        suffix: cleanSuffix || null,
+        target_length: combinedLength,
         status: 'PENDING',
         payment_signature: signature,
         client_pubkey: clientPubkey,
-        price_paid: priceSol, // <--- ADDED: Records exact SOL amount for accurate refunds & stats
+        price_sol: priceSol,       // Populates pricing fields for full alignment
+        price_paid: priceSol,      
+        result_payload: isSuperUserMode ? 'SUPER_SEARCH_PENDING' : null, // Flags workers without schema changes
         created_at: new Date().toISOString()
       });
 

@@ -3,30 +3,34 @@
 import { useState, useMemo } from "react";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { SystemProgram, Transaction, PublicKey, LAMPORTS_PER_SOL } from "@solana/web3.js";
-import { Zap, Search, Cpu, Shield, ChevronDown, Info, Lock, Flame, CheckCircle2, Wallet } from "lucide-react";
+import { Zap, Search, Cpu, Shield, ChevronDown, Info, Lock, Flame, CheckCircle2, Wallet, AlertTriangle } from "lucide-react";
 import nacl from "tweetnacl";
-import util from "tweetnacl-util";
+import { sha256 } from "@noble/hashes/sha256";
+import bs58 from "bs58";
 
 const FAQS = [
   { question: "What is a Solana Vanity Address?", answer: "A vanity address is a custom cryptocurrency wallet address that starts or ends with specific characters of your choosing, such as 'PUMP...'. It works exactly like a normal Solana wallet but offers recognizable branding for your project, DAO, or personal use." },
   { question: "How is SolanaKeys different from other generators?", answer: "Most vanity generators force your web browser to do the math, which freezes your computer and takes days for complex names. SolanaKeys dispatches your request to a dedicated backend GPU cluster, generating millions of hashes per second without slowing down your machine." },
   { question: "Is it safe to generate my private key here?", answer: "Yes. Our GPU nodes operate in strict isolation. Once your address is found, the private key is securely encrypted and delivered directly to your vault. We provide a 'Delete From Server' button so you can permanently purge the key from our database the moment you save it." },
-  { question: "How long does it take to generate?", answer: "Wait times depend exponentially on the length of your request. 1-4 characters take seconds. 5 characters take a few minutes. 6-7 characters can take hours. If you don't want to wait, browse our Instant Storefront for pre-generated elite addresses." },
-  { question: "Are there any restricted characters?", answer: "Yes. Solana uses Base58 encoding. To prevent visual confusion, the characters '0' (zero), 'O' (capital o), 'I' (capital i), and 'l' (lowercase L) are permanently excluded from all Solana addresses." }
+  { question: "How long does it take to generate?", answer: "Wait times depend exponentially on the length of your request. Standard 1-5 characters take anywhere from seconds to a few minutes. Requests exceeding 5 characters require upgrading to our dedicated 24-Hour Super Search tier." },
+  { question: "Are there any restricted characters?", answer: "Yes. Solana uses Base58 encoding. To prevent visual confusion, the characters '0' (zero), 'O' (capital o), 'I' (capital i), and 'l' (lowercase L) are permanently excluded from all Solana addresses." },
+  { 
+    question: "Can I cancel a generation and get a refund?", 
+    answer: "Yes! If a generation is taking longer than expected, you can abort the task at any time directly from your Vault. You will receive an automated, cryptographically secured refund back to your wallet (less a standard 2% network/compute fee). If the job has been running for over an hour, the refund is pro-rated to cover raw GPU electricity costs." 
+  }
 ];
 
 export default function GeneratorView({ onJobQueued }: { onJobQueued: () => void }) {
   const { connection } = useConnection();
-  const { connected, publicKey, sendTransaction } = useWallet();
+  const { connected, publicKey, sendTransaction, signMessage } = useWallet();
   const [prefixValue, setPrefixValue] = useState("");
   const [suffixValue, setSuffixValue] = useState("");
+  const [isSuperUser, setIsSuperUser] = useState(false);
   const [isDeploying, setIsDeploying] = useState(false);
   const [openFaq, setOpenFaq] = useState<number | null>(null);
 
   const difficultyMetrics = useMemo(() => {
     const totalLength = (prefixValue?.length || 0) + (suffixValue?.length || 0);
-    
-    // Calculate exact Base58 cardinality space
     const searchSpace = Math.pow(58, totalLength);
 
     let tier = "Base Tier";
@@ -36,38 +40,36 @@ export default function GeneratorView({ onJobQueued }: { onJobQueued: () => void
     let isPremium = false;
 
     if (totalLength > 0) {
-      if (totalLength <= 4) { 
+      if (isSuperUser) {
+        tier = "Super Search Tier";
+        priceEstimate = "2.50 SOL";
+        expectedTime = "Up to 24 Hours Max";
+        numericalPrice = 2.50;
+        isPremium = true;
+      } else if (totalLength <= 4) { 
         tier = "Base Tier"; priceEstimate = "0.01 SOL"; expectedTime = "< 1 second"; numericalPrice = 0.01; isPremium = false; 
-      }
-      else if (totalLength === 5) { 
-        tier = "Standard Tier"; priceEstimate = "0.15 SOL"; expectedTime = "~2 seconds"; numericalPrice = 0.15; isPremium = true; 
-      }
-      else if (totalLength === 6) { 
-        tier = "Premium Tier"; priceEstimate = "0.45 SOL"; expectedTime = "~30 seconds"; numericalPrice = 0.45; isPremium = true; 
-      }
-      else if (totalLength === 7) { 
-        tier = "Elite Tier"; priceEstimate = "1.50 SOL"; expectedTime = "~20 minutes"; numericalPrice = 1.50; isPremium = true; 
-      }
-      else if (totalLength === 8) { 
-        tier = "Titanium Tier"; priceEstimate = "4.50 SOL"; expectedTime = "~18 hours"; numericalPrice = 4.50; isPremium = true; 
-      }
-      else { 
-        // 9+ Characters will lock the UI and demand a custom quote
-        tier = "Enterprise Custom"; priceEstimate = "Quotation Only"; expectedTime = "Days / Weeks"; numericalPrice = -1; isPremium = true; 
+      } else if (totalLength === 5) { 
+        tier = "Standard Tier"; priceEstimate = "0.15 SOL"; expectedTime = "~2 minutes"; numericalPrice = 0.15; isPremium = true; 
+      } else {
+        tier = "Tier Cap Exceeded"; priceEstimate = "Upgrade Required"; expectedTime = "Blocked"; numericalPrice = -1; isPremium = true;
       }
     }
     return { totalLength, searchSpace, tier, priceEstimate, expectedTime, numericalPrice, isPremium };
-  }, [prefixValue, suffixValue]);
+  }, [prefixValue, suffixValue, isSuperUser]);
+
+  // Clean and enforce character limit properties
+  const totalChars = (prefixValue?.length || 0) + (suffixValue?.length || 0);
+  const isLengthInvalid = totalChars > 5 && !isSuperUser;
 
   const handlePushToQueue = async () => {
     if (!prefixValue && !suffixValue) return;
-    if (!connected || !publicKey) {
-      alert("Please connect your wallet first so we know where to assign the address!");
+    if (!connected || !publicKey || !signMessage) {
+      alert("Please connect a wallet that supports cryptographic message signing!");
       return;
     }
 
-    if (difficultyMetrics.numericalPrice === -1) {
-      alert("This configuration requires a custom quotation. Please trim character lengths to proceed instantly.");
+    if (difficultyMetrics.numericalPrice === -1 || isLengthInvalid) {
+      alert("This configuration exceeds standard lengths. Please enable 'Super Search' or trim your target characters.");
       return;
     }
 
@@ -76,8 +78,36 @@ export default function GeneratorView({ onJobQueued }: { onJobQueued: () => void
     try {
       const adminWalletStr = process.env.NEXT_PUBLIC_ADMIN_WALLET;
       if (!adminWalletStr) throw new Error("Admin wallet address configuration missing");
+
+      // --- STATELESS DETERMINISTIC KEY DERIVATION (HARDENED) ---
+      // Strict structural declaration to minimize phishing exposure risks
+      const authMessageStr = 
+        `[SolanaKeys Official Vault Authentication]\n` +
+        `Domain: solanakeys.com\n` +
+        `Wallet: ${publicKey.toBase58()}\n` +
+        `Purpose: Derive End-to-End Encryption key for secure vault access.\n` +
+        `Security Notice: Never sign this message on any domain other than solanakeys.com. If signed elsewhere, malicious software can expose historical secrets.`;
+
+      const messageBytes = new TextEncoder().encode(authMessageStr);
       
-      // 1. Mandatory Solana Payment for ALL tiers
+      let signatureBytes;
+      try {
+        signatureBytes = await signMessage(messageBytes);
+      } catch (signErr) {
+        throw new Error("Handshake signature rejected. Authentication is mandatory to secure your End-to-End Encryption.");
+      }
+
+      // Contextual double-salting to isolate seed derivation from third-party scripting environments
+      const hasher = sha256.create();
+      hasher.update(signatureBytes);
+      hasher.update(new TextEncoder().encode("SolanaKeys_Internal_App_Pepper_v1"));
+      const cleanSeed32 = hasher.digest();
+
+      const ephemeralKeyPair = nacl.box.keyPair.fromSecretKey(cleanSeed32);
+      const publicKeyBase64 = btoa(String.fromCharCode(...ephemeralKeyPair.publicKey));
+      // ------------------------------------------------------------------
+      
+      // On-Chain Transaction Settlement
       const destinationPubkey = new PublicKey(adminWalletStr);
       const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
 
@@ -97,22 +127,7 @@ export default function GeneratorView({ onJobQueued }: { onJobQueued: () => void
         skipPreflight: true,
       });
 
-      // --- NEW: PERSISTENT ZERO KNOWLEDGE ENCRYPTION HANDSHAKE ---
-      let secretKeyBase64 = localStorage.getItem(`solana_keys_secret_${publicKey.toBase58()}`);
-      let publicKeyBase64 = localStorage.getItem(`solana_keys_pub_${publicKey.toBase58()}`);
-
-      // Only generate a new lockbox if one doesn't already exist for this wallet!
-      if (!secretKeyBase64 || !publicKeyBase64) {
-        const ephemeralKeyPair = nacl.box.keyPair();
-        publicKeyBase64 = util.encodeBase64(ephemeralKeyPair.publicKey);
-        secretKeyBase64 = util.encodeBase64(ephemeralKeyPair.secretKey);
-        
-        localStorage.setItem(`solana_keys_secret_${publicKey.toBase58()}`, secretKeyBase64);
-        localStorage.setItem(`solana_keys_pub_${publicKey.toBase58()}`, publicKeyBase64);
-      }
-      // -----------------------------------------------------------
-
-      // 3. Send the verified signature and lock to the backend
+      // Transmit parameters along with our derived base64 vault public lock structure
       const response = await fetch('/api/generator/search', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -123,15 +138,16 @@ export default function GeneratorView({ onJobQueued }: { onJobQueued: () => void
           suffix: suffixValue || null,
           priceSol: difficultyMetrics.numericalPrice,
           clientPubkey: publicKeyBase64,
+          isSuperUserMode: isSuperUser
         }),
       });
 
       const result = await response.json();
-
       if (!response.ok) throw new Error(result.error || "Failed to secure backend queue position.");
 
       setPrefixValue("");
       setSuffixValue("");
+      setIsSuperUser(false);
       onJobQueued();
 
     } catch (error: any) {
@@ -175,9 +191,9 @@ export default function GeneratorView({ onJobQueued }: { onJobQueued: () => void
             <Lock size={20} className="text-green-600 dark:text-green-400" />
           </div>
           <div>
-            <h3 className="font-black tracking-widest uppercase text-sm text-green-600 dark:text-green-400 mb-1">True Zero-Knowledge Generation</h3>
+            <h3 className="font-black tracking-widest uppercase text-sm text-green-600 dark:text-green-400 mb-1">Indestructible Signature Authentication</h3>
             <p className="text-sm leading-relaxed opacity-90">
-              Secured via client-side Curve25519 encryption. Your private key is mathematically locked by your browser before it ever leaves our GPU. We cannot see your keys.
+              Secured via stateless wallet signatures. Decryption keys are derived instantly from your live wallet handle and never touch persistent browser storage. Zero tracking. Zero loss risk during wallet-switching.
             </p>
           </div>
         </div>
@@ -190,8 +206,8 @@ export default function GeneratorView({ onJobQueued }: { onJobQueued: () => void
               value={prefixValue} 
               onChange={(e) => setPrefixValue(e.target.value.replace(/[^a-km-zn-zA-HJ-NP-Z1-9]/g, ''))}
               placeholder="e.g., Pump" 
-              className="w-full bg-input border border-card-border rounded-xl px-5 py-4 font-mono text-lg outline-none focus:border-purple-500 focus:ring-2 focus:ring-purple-500/20 transition-all tracking-widest shadow-inner" 
-              maxLength={12}
+              className={`w-full bg-input border rounded-xl px-5 py-4 font-mono text-lg outline-none transition-all tracking-widest shadow-inner ${isLengthInvalid ? 'border-red-500 focus:border-red-500 focus:ring-2 focus:ring-red-500/20 text-red-500' : 'border-card-border focus:border-purple-500 focus:ring-2 focus:ring-purple-500/20'}`}
+              maxLength={10}
             />
           </div>
           <div>
@@ -201,16 +217,47 @@ export default function GeneratorView({ onJobQueued }: { onJobQueued: () => void
               value={suffixValue} 
               onChange={(e) => setSuffixValue(e.target.value.replace(/[^a-km-zn-zA-HJ-NP-Z1-9]/g, ''))}
               placeholder="e.g., BoT" 
-              className="w-full bg-input border border-card-border rounded-xl px-5 py-4 font-mono text-lg outline-none focus:border-purple-500 focus:ring-2 focus:ring-purple-500/20 transition-all tracking-widest shadow-inner" 
-              maxLength={12}
+              className={`w-full bg-input border rounded-xl px-5 py-4 font-mono text-lg outline-none transition-all tracking-widest shadow-inner ${isLengthInvalid ? 'border-red-500 focus:border-red-500 focus:ring-2 focus:ring-red-500/20 text-red-500' : 'border-card-border focus:border-purple-500 focus:ring-2 focus:ring-purple-500/20'}`}
+              maxLength={10}
             />
           </div>
         </div>
 
         {/* Base58 Rule Banner - Compact */}
-        <div className="mb-8 flex items-center justify-center gap-2 text-xs font-bold text-zinc-500 uppercase tracking-widest relative z-10">
+        <div className="mb-6 flex items-center justify-center gap-2 text-xs font-bold text-zinc-500 uppercase tracking-widest relative z-10">
           <Info size={14} /> Base58 Rules: Capital <span className="text-purple-500">L</span> allowed. Excludes: <span className="text-red-400">0, O, I, l</span>.
         </div>
+
+        {/* Dynamic Architectural Guardrail Banner */}
+        {totalChars > 5 && (
+          <div className={`mb-8 p-4 border rounded-xl text-sm relative z-10 transition-colors duration-300 ${!isSuperUser ? 'bg-red-500/10 border-red-500/30 text-red-900 dark:text-red-300' : 'bg-amber-500/10 border-amber-500/30 text-amber-900 dark:text-amber-300'}`}>
+            <div className="flex gap-3 items-start">
+              <AlertTriangle className={`${!isSuperUser ? 'text-red-500' : 'text-amber-500'} shrink-0 mt-0.5`} size={18} />
+              <div>
+                <p className="font-bold">
+                  {!isSuperUser ? `Generation Blocked: Limit Exceeded (${totalChars}/5 chars)` : `Super Search Active (${totalChars} chars)`}
+                </p>
+                <p className="text-xs mt-1 opacity-90 leading-relaxed">
+                  {!isSuperUser 
+                    ? "Standard generation is strictly capped at 5 total characters to protect cloud infrastructure. You must shorten your target or toggle Super Search below." 
+                    : "You have unlocked the 24-hour dedicated GPU tier. This will execute an unrestricted deep search."}
+                </p>
+                
+                <label className={`flex items-center gap-3 mt-4 p-3 rounded-lg cursor-pointer transition-all select-none border ${!isSuperUser ? 'bg-red-500/10 border-red-500/20 hover:bg-red-500/20' : 'bg-zinc-900/40 border-amber-500/20 hover:bg-zinc-900/60'}`}>
+                  <input 
+                    type="checkbox" 
+                    checked={isSuperUser} 
+                    onChange={(e) => setIsSuperUser(e.target.checked)}
+                    className="w-4 h-4 rounded accent-purple-500 cursor-pointer"
+                  />
+                  <span className="text-xs font-black uppercase tracking-wider text-purple-400">
+                    Unlock Super User Tier (Fixed Rate 24h GPU Run) — 2.50 SOL
+                  </span>
+                </label>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Wallet UI Preview */}
         <div className="mb-10 relative z-10">
@@ -242,17 +289,17 @@ export default function GeneratorView({ onJobQueued }: { onJobQueued: () => void
           <div className="flex justify-between items-end border-b border-card-border/50 pb-4">
             <div>
               <span className="text-zinc-500 dark:text-zinc-400 font-bold text-xs uppercase tracking-widest block mb-1">Execution Profile</span>
-              <span className={`font-black text-lg ${difficultyMetrics.isPremium ? 'text-purple-600 dark:text-purple-400' : 'text-foreground'}`}>{difficultyMetrics.tier}</span>
+              <span className={`font-black text-lg ${isLengthInvalid ? 'text-red-500' : difficultyMetrics.isPremium ? 'text-purple-600 dark:text-purple-400' : 'text-foreground'}`}>{difficultyMetrics.tier}</span>
             </div>
             <div className="text-right">
               <span className="text-zinc-500 dark:text-zinc-400 font-bold text-xs uppercase tracking-widest block mb-1">Compute ETA</span>
-              <span className="font-bold text-zinc-700 dark:text-zinc-300">{difficultyMetrics.expectedTime}</span>
+              <span className={`font-bold ${isLengthInvalid ? 'text-red-500' : 'text-zinc-700 dark:text-zinc-300'}`}>{difficultyMetrics.expectedTime}</span>
             </div>
           </div>
           
           <div className="flex justify-between items-center pt-2">
             <span className="text-lg font-bold text-zinc-600 dark:text-zinc-300">Cluster Fee</span>
-            <span className={`text-3xl font-black tracking-tight ${difficultyMetrics.isPremium ? 'text-transparent bg-clip-text bg-gradient-to-r from-purple-500 to-blue-500' : 'text-foreground'}`}>
+            <span className={`text-3xl font-black tracking-tight ${isLengthInvalid ? 'text-red-500' : difficultyMetrics.isPremium ? 'text-transparent bg-clip-text bg-gradient-to-r from-purple-500 to-blue-500' : 'text-foreground'}`}>
               {difficultyMetrics.priceEstimate}
             </span>
           </div>
@@ -260,13 +307,15 @@ export default function GeneratorView({ onJobQueued }: { onJobQueued: () => void
 
         <button 
           onClick={handlePushToQueue}
-          disabled={(!prefixValue && !suffixValue) || isDeploying}
-          className={`relative z-10 w-full font-black uppercase tracking-widest py-5 rounded-xl transition-all duration-300 shadow-xl cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:scale-100 disabled:shadow-none hover:scale-[1.01] hover:shadow-2xl active:scale-[0.99]
-            ${difficultyMetrics.isPremium 
-              ? 'bg-gradient-to-r from-purple-600 to-indigo-600 text-white hover:from-purple-500 hover:to-indigo-500' 
-              : 'bg-foreground text-background hover:bg-zinc-800 dark:hover:bg-zinc-200'}`}
+          disabled={(!prefixValue && !suffixValue) || isDeploying || isLengthInvalid}
+          className={`relative z-10 w-full font-black uppercase tracking-widest py-5 rounded-xl transition-all duration-300 shadow-xl cursor-pointer disabled:cursor-not-allowed disabled:hover:scale-100 disabled:shadow-none hover:scale-[1.01] hover:shadow-2xl active:scale-[0.99]
+            ${isLengthInvalid 
+              ? 'bg-red-950/40 text-red-500 border border-red-900/50 shadow-none'
+              : difficultyMetrics.isPremium 
+                ? 'bg-gradient-to-r from-purple-600 to-indigo-600 text-white hover:from-purple-500 hover:to-indigo-500' 
+                : 'bg-foreground text-background hover:bg-zinc-800 dark:hover:bg-zinc-200'}`}
         >
-          {isDeploying ? "Deploying to GPUs..." : connected ? `Secure & Generate (${difficultyMetrics.priceEstimate})` : "Connect Wallet to Generate"}
+          {isDeploying ? "Deploying to GPUs..." : !connected ? "Connect Wallet to Generate" : isLengthInvalid ? `Blocked: ${totalChars}/5 Chars` : `Secure & Generate (${difficultyMetrics.priceEstimate})`}
         </button>
       </div>
 
@@ -295,9 +344,9 @@ export default function GeneratorView({ onJobQueued }: { onJobQueued: () => void
             <div className="bg-green-100 dark:bg-green-500/10 w-14 h-14 rounded-xl flex items-center justify-center mb-6 text-green-600 dark:text-green-400">
               <Shield size={28} />
             </div>
-            <h3 className="font-black text-lg mb-3">Zero-Knowledge Vault</h3>
+            <h3 className="font-black text-lg mb-3">Deterministic E2EE Vault</h3>
             <p className="text-sm text-zinc-500 leading-relaxed">
-              Retrieve your key via our strictly isolated E2EE pipeline. We provide a one-click purge button so you can physically destroy the server record the second it hits your Phantom wallet.
+              Retrieve your key via our strictly isolated cryptographic pipeline. No storage footprints left in your browser state—keys survive mobile sandbox cache clear events seamlessly.
             </p>
           </div>
         </div>
