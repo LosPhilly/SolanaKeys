@@ -7,6 +7,8 @@ import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { SystemProgram, Transaction, PublicKey, LAMPORTS_PER_SOL } from "@solana/web3.js";
 import nacl from "tweetnacl";
 import util from "tweetnacl-util";
+import { sha256 } from "@noble/hashes/sha256";
+import bs58 from "bs58";
 
 export default function ExchangeView() {
   const [inventory, setInventory] = useState<any[]>([]);
@@ -16,7 +18,7 @@ export default function ExchangeView() {
   const itemsPerPage = 9;
 
   const { connection } = useConnection();
-  const { publicKey, sendTransaction } = useWallet();
+  const { publicKey, sendTransaction, signMessage } = useWallet();
   const [processingId, setProcessingId] = useState<string | null>(null);
 
   const adminWalletEnv = process.env.NEXT_PUBLIC_ADMIN_WALLET;
@@ -47,8 +49,8 @@ export default function ExchangeView() {
   };
 
   const handleExchangePurchase = async (item: any) => {
-    if (!publicKey) {
-      alert("Please connect your wallet first to purchase.");
+    if (!publicKey || !signMessage) {
+      alert("Please connect a wallet that supports message signing to purchase.");
       return;
     }
 
@@ -60,8 +62,28 @@ export default function ExchangeView() {
     try {
       setProcessingId(item.id);
 
-      const totalLamports = item.listing_price * LAMPORTS_PER_SOL;
-      const adminFeeLamports = Math.floor(totalLamports * 0.05); 
+      // 1. STATELESS DETERMINISTIC ENCRYPTION HANDSHAKE
+      const authMessageStr = 
+        `[SolanaKeys Official Vault Authentication]\n` +
+        `Domain: solanakeys.com\n` +
+        `Wallet: ${publicKey.toBase58()}\n` +
+        `Purpose: Derive End-to-End Encryption key for secure vault access.\n` +
+        `Security Notice: Never sign this message on any domain other than solanakeys.com. If signed elsewhere, malicious software can expose historical secrets.`;
+
+      const messageBytes = new TextEncoder().encode(authMessageStr);
+      const signatureBytes = await signMessage(messageBytes);
+
+      const hasher = sha256.create();
+      hasher.update(signatureBytes);
+      hasher.update(new TextEncoder().encode("SolanaKeys_Internal_App_Pepper_v1"));
+      const cleanSeed32 = hasher.digest();
+
+      const ephemeralKeyPair = nacl.box.keyPair.fromSecretKey(cleanSeed32);
+      const clientPubkeyBase64 = util.encodeBase64(ephemeralKeyPair.publicKey);
+
+      // 2. ON-CHAIN PAYMENT (95% to Seller, 5% to Admin)
+      const totalLamports = Math.round(item.listing_price * LAMPORTS_PER_SOL);
+      const adminFeeLamports = Math.round(totalLamports * 0.05); 
       const sellerLamports = totalLamports - adminFeeLamports;
 
       const transaction = new Transaction().add(
@@ -89,22 +111,22 @@ export default function ExchangeView() {
         lastValidBlockHeight
       }, 'confirmed');
 
-      const ephemeralKeyPair = nacl.box.keyPair();
-      const clientPubkeyBase64 = util.encodeBase64(ephemeralKeyPair.publicKey);
-      const secretKeyBase64 = util.encodeBase64(ephemeralKeyPair.secretKey);
-
-      localStorage.setItem(`solana_keys_secret_${publicKey.toBase58()}`, secretKeyBase64);
-
+      // 3. SECURE HANDOVER API CALL
+      // priceSol intentionally omitted — server reads listing_price from DB
       const response = await fetch('/api/exchange/purchase', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Wallet-Address': publicKey.toBase58(),
+        },
         body: JSON.stringify({
           signature,
+          blockhash,
+          lastValidBlockHeight,
           buyerWallet: publicKey.toBase58(),
           sellerWallet: item.customer_wallet,
           itemId: item.id,
-          priceSol: item.listing_price,
-          clientPubkey: clientPubkeyBase64 
+          clientPubkey: clientPubkeyBase64,
         }),
       });
 
@@ -127,27 +149,52 @@ export default function ExchangeView() {
 
   // --- NEW: CANCEL LISTING FUNCTION ---
   const handleCancelListing = async (item: any) => {
-    if (!publicKey) return;
+    if (!publicKey || !signMessage) {
+        alert("Please connect a wallet that supports message signing to cancel.");
+        return;
+    }
 
     try {
       setProcessingId(item.id);
 
-      // Generate a fresh lockbox for the returning item
-      const ephemeralKeyPair = nacl.box.keyPair();
+      // 1. STATELESS DETERMINISTIC ENCRYPTION HANDSHAKE
+      const authMessageStr = 
+        `[SolanaKeys Official Vault Authentication]\n` +
+        `Domain: solanakeys.com\n` +
+        `Wallet: ${publicKey.toBase58()}\n` +
+        `Purpose: Derive End-to-End Encryption key for secure vault access.\n` +
+        `Security Notice: Never sign this message on any domain other than solanakeys.com. If signed elsewhere, malicious software can expose historical secrets.`;
+
+      const messageBytes = new TextEncoder().encode(authMessageStr);
+      const signatureBytes = await signMessage(messageBytes);
+
+      const hasher = sha256.create();
+      hasher.update(signatureBytes);
+      hasher.update(new TextEncoder().encode("SolanaKeys_Internal_App_Pepper_v1"));
+      const cleanSeed32 = hasher.digest();
+
+      const ephemeralKeyPair = nacl.box.keyPair.fromSecretKey(cleanSeed32);
       const clientPubkeyBase64 = util.encodeBase64(ephemeralKeyPair.publicKey);
-      const secretKeyBase64 = util.encodeBase64(ephemeralKeyPair.secretKey);
 
-      // Save the secret key so the Vault can decrypt it
-      localStorage.setItem(`solana_keys_secret_${publicKey.toBase58()}`, secretKeyBase64);
+      // 2. CANCEL_LISTING signed message — proves wallet ownership server-side
+      const cancelMsgStr = `Authenticate to SolanaKeys.\nAction: CANCEL_LISTING\nJob ID: ${item.id}`;
+      const cancelSigBytes = await signMessage(new TextEncoder().encode(cancelMsgStr));
+      const cancelSignature = bs58.encode(cancelSigBytes);
 
+      // 3. SECURE CANCELLATION API CALL
       const response = await fetch('/api/exchange/cancel', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Wallet-Address': publicKey.toBase58(),
+        },
         body: JSON.stringify({
           jobId: item.id,
           userWallet: publicKey.toBase58(),
-          clientPubkey: clientPubkeyBase64
-        })
+          clientPubkey: clientPubkeyBase64,
+          message: cancelMsgStr,
+          signature: cancelSignature,
+        }),
       });
 
       if (!response.ok) {

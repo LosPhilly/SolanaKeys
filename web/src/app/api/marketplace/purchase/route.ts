@@ -36,10 +36,14 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Server encryption misconfiguration.' }, { status: 500 });
     }
 
-    const { signature, userWallet, itemId, clientPubkey } = await req.json();
+    const { signature, userWallet, itemId, clientPubkey, blockhash, lastValidBlockHeight } = await req.json();
 
     if (!signature || !userWallet || !itemId || !clientPubkey) {
       return NextResponse.json({ error: 'Missing purchase metadata or encryption lock' }, { status: 400 });
+    }
+
+    if (!blockhash || !lastValidBlockHeight) {
+      return NextResponse.json({ error: 'Missing transaction confirmation parameters (blockhash / lastValidBlockHeight).' }, { status: 400 });
     }
 
     // 2. Fetch the targeted item to know how much SOL to expect
@@ -53,28 +57,31 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Inventory item not found or already sold' }, { status: 404 });
     }
 
-    const expectedLamports = item.price_sol * 1_000_000_000;
+    const expectedLamports = Math.round(item.price_sol * 1_000_000_000);
 
-    console.log("1. Waiting 5 seconds for Devnet to sync...");
-    // Increased delay to 5 seconds. Devnet nodes can be heavily delayed.
-    await new Promise(resolve => setTimeout(resolve, 5000));
-
-    console.log("2. Fetching transaction signature:", signature);
-    // 3. Fetch transaction details from the Solana blockchain
-    const tx = await connection.getParsedTransaction(signature, {
-      maxSupportedTransactionVersion: 0,
-      commitment: 'confirmed'
-    });
-
-    console.log("3. Helius RPC Response:", tx ? "Found it!" : "NULL - Not found");
-
-    if (!tx) {
-      return NextResponse.json({ error: 'Transaction not found on-chain. RPC sync delayed.' }, { status: 400 });
+    // Confirm the transaction using the blockhash window captured at send time.
+    console.log(`[routeMarket] Confirming payment tx: ${signature}`);
+    try {
+      const result = await connection.confirmTransaction(
+        { signature, blockhash, lastValidBlockHeight },
+        'confirmed'
+      );
+      if (result.value.err) {
+        console.error('[routeMarket] Transaction failed on-chain:', result.value.err);
+        return NextResponse.json({ error: 'Payment transaction failed on-chain.' }, { status: 400 });
+      }
+    } catch (confirmErr: any) {
+      console.error('[routeMarket] confirmTransaction error:', confirmErr.message);
+      return NextResponse.json({ error: 'Payment transaction could not be confirmed. It may have expired — please try again.' }, { status: 400 });
     }
 
-    if (tx.meta?.err) {
-       console.log("4. On-chain error detected:", tx.meta.err);
-       return NextResponse.json({ error: 'Transaction failed on-chain' }, { status: 400 });
+    const tx = await connection.getParsedTransaction(signature, {
+      maxSupportedTransactionVersion: 0,
+      commitment: 'confirmed',
+    });
+
+    if (!tx || tx.meta?.err) {
+      return NextResponse.json({ error: 'Could not retrieve confirmed transaction details.' }, { status: 400 });
     }
 
     // 4. Verify the transfer instruction

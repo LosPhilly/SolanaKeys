@@ -6,12 +6,13 @@ import util from 'tweetnacl-util';
 import bs58 from 'bs58';
 
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_KEY!);
-const connection = new Connection(process.env.NEXT_PUBLIC_SOLANA_RPC_URL || "https://api.devnet.solana.com", "confirmed");
+const connection = new Connection(
+  process.env.NEXT_PUBLIC_SOLANA_RPC_URL || 'https://api.devnet.solana.com',
+  'confirmed'
+);
 
-// The wallet that collects the listing fees
 const PLATFORM_FEE_WALLET = process.env.NEXT_PUBLIC_ADMIN_WALLET;
-// The required fee to list an item on the exchange
-const LISTING_FEE_SOL = 0.025; 
+const LISTING_FEE_SOL = 0.025;
 
 export async function POST(req: Request) {
   try {
@@ -19,17 +20,22 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Server misconfiguration: Missing Admin Wallet.' }, { status: 500 });
     }
 
-    const { jobId, userWallet, rawPrivateKey, priceSol, paymentSignature } = await req.json();
+    // rawPrivateKey is intentionally absent — the server derives the escrow payload
+    // from master_payload stored at job completion. The client never sends a raw key.
+    const { jobId, userWallet, priceSol, paymentSignature, blockhash, lastValidBlockHeight } = await req.json();
 
-    // Now we explicitly require the paymentSignature
-    if (!jobId || !rawPrivateKey || !priceSol || !userWallet || !paymentSignature) {
-      return NextResponse.json({ error: 'Missing listing data or payment signature' }, { status: 400 });
+    if (!jobId || !priceSol || !userWallet || !paymentSignature) {
+      return NextResponse.json({ error: 'Missing listing data or payment signature.' }, { status: 400 });
     }
 
-    // 1. Fetch the job and ensure it exists and has not been compromised/revealed
+    // blockhash/lastValidBlockHeight accepted from client but not used for server confirmation —
+    // client confirms before POSTing, so the window may already be closed by the time
+    // the server processes the request. We fetch the confirmed tx directly instead.
+
+    // 1. Fetch the job — need result_address, master_payload, and guard fields
     const { data: job, error: jobError } = await supabase
       .from('vanity_jobs')
-      .select('*')
+      .select('customer_wallet, result_address, master_payload, is_revealed, is_listed')
       .eq('id', jobId)
       .single();
 
@@ -37,29 +43,47 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Vanity job record not found.' }, { status: 404 });
     }
 
-    if (job.is_revealed) {
-      return NextResponse.json({ error: 'Revealed keys cannot be listed.' }, { status: 403 });
-    }
-
     if (job.customer_wallet !== userWallet) {
       return NextResponse.json({ error: 'Unauthorized: Wallet mismatch.' }, { status: 401 });
     }
 
-    // --- NEW: VERIFY THE LISTING FEE PAYMENT ON-CHAIN ---
-    console.log("Waiting 5 seconds for Solana RPC to sync the listing fee transaction...");
-    await new Promise(resolve => setTimeout(resolve, 5000));
-    
-    const tx = await connection.getParsedTransaction(paymentSignature, {
-      maxSupportedTransactionVersion: 0,
-      commitment: 'confirmed'
-    });
+    if (job.is_revealed) {
+      return NextResponse.json({ error: 'Revealed keys cannot be listed.' }, { status: 403 });
+    }
+
+    if (job.is_listed) {
+      return NextResponse.json({ error: 'This item is already listed.' }, { status: 409 });
+    }
+
+    // master_payload must exist — written by the worker at job completion.
+    // Jobs pre-dating this architecture cannot be listed.
+    if (!job.master_payload) {
+      return NextResponse.json(
+        { error: 'This job does not support server-side escrow. Please contact support.' },
+        { status: 400 }
+      );
+    }
+
+    // 2. Fetch the confirmed listing fee transaction — client already confirmed it before
+    // POSTing, so we skip server-side confirmTransaction which can fail if the blockhash
+    // window has expired by the time the server processes the request.
+    console.log(`[routelist] Fetching confirmed listing fee tx: ${paymentSignature}`);
+    let tx = null;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      tx = await connection.getParsedTransaction(paymentSignature, {
+        maxSupportedTransactionVersion: 0,
+        commitment: 'confirmed',
+      });
+      if (tx) break;
+      await new Promise(r => setTimeout(r, 2000));
+    }
 
     if (!tx || !tx.meta) {
-      return NextResponse.json({ error: 'Listing fee transaction not found or unconfirmed' }, { status: 400 });
+      return NextResponse.json({ error: 'Could not retrieve confirmed listing fee transaction. Please try again.' }, { status: 400 });
     }
 
     if (tx.meta.err) {
-      return NextResponse.json({ error: 'Listing fee transaction failed on-chain' }, { status: 400 });
+      return NextResponse.json({ error: 'Listing fee transaction failed on-chain.' }, { status: 400 });
     }
 
     const expectedLamports = Math.round(LISTING_FEE_SOL * LAMPORTS_PER_SOL);
@@ -68,12 +92,7 @@ export async function POST(req: Request) {
     for (const inst of tx.transaction.message.instructions) {
       if ('parsed' in inst && inst.program === 'system' && inst.parsed.type === 'transfer') {
         const { destination, lamports, source } = inst.parsed.info;
-
-        if (
-          source === userWallet && 
-          destination === PLATFORM_FEE_WALLET && 
-          lamports === expectedLamports
-        ) {
+        if (source === userWallet && destination === PLATFORM_FEE_WALLET && lamports === expectedLamports) {
           feePaid = true;
           break;
         }
@@ -81,80 +100,85 @@ export async function POST(req: Request) {
     }
 
     if (!feePaid) {
-      console.error("Listing fee verification failed.");
-      return NextResponse.json({ error: `Fraud detected: Did not receive the ${LISTING_FEE_SOL} SOL listing fee.` }, { status: 400 });
+      return NextResponse.json(
+        { error: `Listing fee not received. Expected ${LISTING_FEE_SOL} SOL from ${userWallet} to platform wallet.` },
+        { status: 400 }
+      );
     }
-    // ----------------------------------------------------
 
-    // --- CRYPTOGRAPHIC GUARD: Prevent Dud Key Uploads ---
+    // 3. Decrypt master_payload to validate the key matches result_address.
+    // Server-side integrity check — no raw key leaves the server.
+    const keysEnv = process.env.MASTER_KEYS || `v1:${process.env.MASTER_INVENTORY_KEY}`;
+    const masterKeyDict = Object.fromEntries(keysEnv.split(',').map(k => k.split(':')));
+
+    const rawPayload = job.master_payload as string;
+    let version = 'v1';
+    let ciphertextBase64 = rawPayload;
+    if (rawPayload.includes(':')) {
+      [version, ciphertextBase64] = rawPayload.split(':');
+    }
+
+    const masterKeyString = masterKeyDict[version];
+    if (!masterKeyString) {
+      throw new Error(`CRITICAL: Master key version ${version} not found.`);
+    }
+
+    const masterKeyBytes = util.decodeBase64(masterKeyString);
+    const encryptedBytes = util.decodeBase64(ciphertextBase64);
+    const nonce = encryptedBytes.slice(0, nacl.secretbox.nonceLength);
+    const box = encryptedBytes.slice(nacl.secretbox.nonceLength);
+    const decryptedBytes = nacl.secretbox.open(box, nonce, masterKeyBytes);
+
+    if (!decryptedBytes) {
+      console.error(`[routelist] Failed to decrypt master_payload for job ${jobId}`);
+      return NextResponse.json({ error: 'Server-side key validation failed.' }, { status: 500 });
+    }
+
+    // 4. Validate the decrypted key matches the stored vanity address
     try {
-      let privateKeyBytes: Uint8Array;
-
-      if (rawPrivateKey.trim().startsWith('[')) {
-        privateKeyBytes = new Uint8Array(JSON.parse(rawPrivateKey));
-      } else {
-        privateKeyBytes = bs58.decode(rawPrivateKey);
-      }
-
+      const phantomBase58 = util.encodeUTF8(decryptedBytes).replace(/\0/g, '').trim();
+      const privateKeyBytes = bs58.decode(phantomBase58);
       const derivedKeypair = Keypair.fromSecretKey(privateKeyBytes);
       const derivedAddress = derivedKeypair.publicKey.toBase58();
 
       if (derivedAddress !== job.result_address) {
-        console.error(`Fraud Attempt Detected: Derived address ${derivedAddress} matches neither expected index ${job.result_address}`);
-        return NextResponse.json({ error: 'Cryptographic validation failed: Private key does not match this vanity address.' }, { status: 400 });
+        console.error(`[routelist] Address mismatch for job ${jobId}: derived ${derivedAddress}, expected ${job.result_address}`);
+        return NextResponse.json(
+          { error: 'Cryptographic validation failed: stored key does not match vanity address.' },
+          { status: 500 }
+        );
       }
-    } catch (cryptoErr) {
-      console.error('Failed to parse or validate private key signature:', cryptoErr);
-      return NextResponse.json({ error: 'Invalid private key data format submitted.' }, { status: 400 });
-    }
-    // --------------------------------------------------------
-
-    // 2. Encrypt the raw key with the Server's ACTIVE Master Inventory Key for Escrow
-    const keysEnv = process.env.MASTER_KEYS || `v1:${process.env.MASTER_INVENTORY_KEY}`;
-    const activeVersion = process.env.ACTIVE_MASTER_KEY || 'v1';
-    const masterKeyDict = Object.fromEntries(keysEnv.split(',').map(k => k.split(':')));
-
-    const activeMasterKeyString = masterKeyDict[activeVersion];
-    if (!activeMasterKeyString) {
-      throw new Error(`CRITICAL: Active master key version ${activeVersion} not found in dictionary.`);
+    } catch (validationErr) {
+      console.error('[routelist] Key validation error:', validationErr);
+      return NextResponse.json({ error: 'Key format invalid during validation.' }, { status: 500 });
     }
 
-    const masterKeyBytes = util.decodeBase64(activeMasterKeyString);
-    const messageBytes = util.decodeUTF8(rawPrivateKey);
-    const nonce = nacl.randomBytes(nacl.secretbox.nonceLength);
-    
-    const encryptedBox = nacl.secretbox(messageBytes, nonce, masterKeyBytes);
-    if (!encryptedBox) throw new Error('Escrow encryption process aborted: Encryption step failed.');
-    
-    // Combine nonce and box so it perfectly matches how the purchase route decrypts
-    const fullMessage = new Uint8Array(nonce.length + encryptedBox.length);
-    fullMessage.set(nonce);
-    fullMessage.set(encryptedBox, nonce.length);
-    
-    const rawEscrowPayload = util.encodeBase64(fullMessage);
-    const safeEscrowPayload = `${activeVersion}:${rawEscrowPayload}`;
+    // 5. Move master_payload to escrow_payload — no re-encryption needed.
+    // master_payload is already in SecretBox format that routePurchase/routeCancle expect.
+    const activeVersion = process.env.ACTIVE_MASTER_KEY || version;
+    const safeEscrowPayload = rawPayload.includes(':') ? rawPayload : `${activeVersion}:${rawPayload}`;
 
-    // 3. Update the database to push it to the Exchange tab
     const { error: updateError } = await supabase
       .from('vanity_jobs')
       .update({
         is_listed: true,
         listing_price: priceSol,
         escrow_payload: safeEscrowPayload,
-        result_payload: 'MOVED_TO_ESCROW' // Burn the client-side ZK payload to permanently disable local wallet spending/double listings
+        master_payload: null,              // Clear after moving to escrow
+        result_payload: 'MOVED_TO_ESCROW', // Burn client SealedBox while listed
       })
       .eq('id', jobId)
       .eq('customer_wallet', userWallet);
 
     if (updateError) {
-      console.error('Database listing execution update failure:', updateError);
-      return NextResponse.json({ error: 'Failed to synchronize listing status to the database.' }, { status: 500 });
+      console.error('[routelist] DB update failed:', updateError);
+      return NextResponse.json({ error: 'Failed to update listing status.' }, { status: 500 });
     }
 
     return NextResponse.json({ success: true });
 
   } catch (error) {
-    console.error('Listing route system error:', error);
+    console.error('[routelist] Unexpected error:', error);
     return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 });
   }
 }

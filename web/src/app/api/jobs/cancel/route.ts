@@ -53,27 +53,44 @@ export async function POST(req: Request) {
     const serverKeypair = Keypair.fromSecretKey(bs58.decode(serverPrivateKeyBase58));
 
     // 4. Calculate the Refund Amount
-    const originalPaymentSol = job.price_sol || 0; // The amount they paid at checkout
+    const originalPaymentSol = job.price_sol || 0;
     if (originalPaymentSol <= 0) {
         await supabase.from('vanity_jobs').update({ status: 'FAILED', result_payload: 'CANCELLED_NO_REFUND' }).eq('id', jobId);
         return NextResponse.json({ success: true, refundAmount: 0 });
     }
 
     const elapsedMinutes = (Date.now() - new Date(job.created_at).getTime()) / 60000;
-    
-    let refundMultiplier = 0.98; // Base case: refund less 2% network fee
-    
-    // Pro-Rated Protection: If it has been running for over an hour, reduce refund to cover raw server electricity/compute costs.
-    if (elapsedMinutes > 60) {
-        const hoursRunning = elapsedMinutes / 60;
-        refundMultiplier = Math.max(0, 0.98 - (hoursRunning * 0.10)); // Drops 10% per hour running
-    }
+
+    // Base: 2% fee covers on-chain transaction costs.
+    // Pro-rated: drops 10% per hour of GPU time consumed, floored at 0.
+    const hoursRunning = elapsedMinutes / 60;
+    const refundMultiplier = Math.max(0, Math.min(0.98, 0.98 - (hoursRunning > 1 ? (hoursRunning - 1) * 0.10 : 0)));
 
     const refundAmountSol = originalPaymentSol * refundMultiplier;
+    // Hard floor: never send less than 5000 lamports (not worth the tx fee)
     const refundLamports = Math.round(refundAmountSol * LAMPORTS_PER_SOL);
+    const MIN_REFUND_LAMPORTS = 5000;
 
-    // 5. Execute On-Chain Refund
-    if (refundLamports > 0) {
+    // 5. Balance check before attempting the on-chain refund
+    if (refundLamports >= MIN_REFUND_LAMPORTS) {
+        const walletBalance = await connection.getBalance(serverKeypair.publicKey);
+        // Require balance to cover refund + estimated tx fee (5000 lamports)
+        if (walletBalance < refundLamports + 5000) {
+            console.error(
+                `[routeJobsNew] Refund wallet underfunded. ` +
+                `Balance: ${walletBalance} lamports, needed: ${refundLamports + 5000}`
+            );
+            // Mark cancelled but do not attempt a transaction we know will fail.
+            // Support team should manually process the refund.
+            await supabase.from('vanity_jobs')
+                .update({ status: 'FAILED', result_payload: 'CANCELLED_REFUND_PENDING_MANUAL' })
+                .eq('id', jobId);
+            return NextResponse.json({
+                error: 'Refund wallet temporarily underfunded. Your refund will be processed manually within 24 hours.',
+                refundAmount: refundAmountSol
+            }, { status: 503 });
+        }
+
         const transaction = new Transaction().add(
           SystemProgram.transfer({
             fromPubkey: serverKeypair.publicKey,
@@ -84,9 +101,9 @@ export async function POST(req: Request) {
 
         try {
             const txSignature = await sendAndConfirmTransaction(connection, transaction, [serverKeypair]);
-            console.log(`Refund executed: ${txSignature}`);
+            console.log(`[routeJobsNew] Refund of ${refundAmountSol.toFixed(4)} SOL sent to ${userWallet}: ${txSignature}`);
         } catch (txError) {
-            console.error("Solana refund transaction failed:", txError);
+            console.error("[routeJobsNew] Refund transaction failed:", txError);
             return NextResponse.json({ error: 'Failed to execute on-chain refund' }, { status: 500 });
         }
     }

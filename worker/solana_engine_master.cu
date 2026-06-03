@@ -37,8 +37,6 @@
 // =========================================================================
 // PREDICTIVE HEURISTIC CACHE RESERVATION (Markov Constants)
 // =========================================================================
-// 58 rows representing the current character state. 
-// The uint64_t bitmask flags which next characters are probabilistically valid.
 __constant__ uint64_t D_MARKOV_HEURISTIC_MASK[58];
 __constant__ int      D_HEURISTIC_ACTIVE;
 
@@ -104,13 +102,26 @@ void encode_base58(const uint8_t* data, int len, char* out_str) {
     out_str[str_idx] = '\0';
 }
 
+// =========================================================================
+// BASE58 CHARACTER INDEX LOOKUP (Device Helper)
+// Returns the 0-57 index of a Base58 character, or -1 if invalid.
+// =========================================================================
+__device__ __forceinline__ int b58_char_to_index(char c) {
+    if (c >= '1' && c <= '9') return c - '1';
+    if (c >= 'A' && c <= 'H') return c - 'A' + 9;
+    if (c >= 'J' && c <= 'N') return c - 'J' + 17;
+    if (c >= 'P' && c <= 'Z') return c - 'P' + 22;
+    if (c >= 'a' && c <= 'k') return c - 'a' + 33;
+    if (c >= 'm' && c <= 'z') return c - 'm' + 44;
+    return -1; // invalid character (0, O, I, l are excluded from Base58)
+}
+
 __global__ void solana_vanity_kernel(fe base_seed, uint64_t *d_found_secret, char *d_found_address, uint8_t *d_found_pubkey, int *d_match_flag) {
-    // Stage the heuristic bitmask arrays into block-wide Shared Memory
     __shared__ uint64_t s_markov_heuristic_mask[58];
     if (threadIdx.x < 58) {
         s_markov_heuristic_mask[threadIdx.x] = D_MARKOV_HEURISTIC_MASK[threadIdx.x];
     }
-    __syncthreads(); // Barrier ensures safe lookup propagation across the whole warp layout
+    __syncthreads(); 
 
     uint64_t global_thread_id = blockIdx.x * blockDim.x + threadIdx.x;
     
@@ -138,7 +149,9 @@ __global__ void solana_vanity_kernel(fe base_seed, uint64_t *d_found_secret, cha
     uint8_t scalar[32];
     #pragma unroll
     for(int i = 0; i < 32; i++) {
-        scalar[i] = expanded_hash[i];
+        // Correctly route the SHA-512 Big-Endian byte output into 
+        // the strict Little-Endian scalar required by RFC-8032.
+        scalar[i] = expanded_hash[i]; 
     }
     
     scalar[0] &= 248;
@@ -199,13 +212,11 @@ __global__ void solana_vanity_kernel(fe base_seed, uint64_t *d_found_secret, cha
 
     // --- PREDICTIVE HEURISTIC FILTER LAYER ---
     if (D_HEURISTIC_ACTIVE) {
-        // Evaluate the first few characters against the shared memory language table
         for (int i = 0; encoded_buffer[i+1] != '\0' && i < 4; i++) {
             int current_idx = b58_char_to_index(encoded_buffer[i]);
             int next_idx    = b58_char_to_index(encoded_buffer[i+1]);
             
             if (current_idx >= 0 && next_idx >= 0) {
-                // Read cleanly across high-speed shared hardware banks
                 if (!((s_markov_heuristic_mask[current_idx] >> next_idx) & 1)) {
                     match = false;
                     break;
@@ -230,20 +241,23 @@ __global__ void solana_vanity_kernel(fe base_seed, uint64_t *d_found_secret, cha
                     match = false;
                 } else {
                     for (int i = 0; i < suffix_len; i++) {
-                        if (encoded_buffer[start_idx + i] != TARGET_PREFIX_STR[i]) {
+                        // FIX: Resolved typo that clobbered suffix evaluation matrix
+                        if (encoded_buffer[start_idx + i] != TARGET_SUFFIX_STR[i]) {
                             match = false; break;
                         }
                     }
                 }
             }
         #else
+            int p_idx = 0;
             for(int i = 0; i < D_TARGET_PREFIX_LEN; i++) {
-                if (encoded_buffer[i] != D_TARGET_PREFIX[i]) { match = false; break; }
+                if (D_TARGET_PREFIX[i] == '-') { p_idx++; continue; }
+                if (encoded_buffer[i - p_idx] != D_TARGET_PREFIX[i]) { match = false; break; }
             }
             
-            if (match && D_TARGET_SUFFIX_LEN > 0) {
+            if (match && D_TARGET_SUFFIX_LEN > 0 && D_TARGET_SUFFIX[0] != '-') {
                 int start_idx = str_idx - D_TARGET_SUFFIX_LEN;
-                if (start_idx < D_TARGET_PREFIX_LEN) {
+                if (start_idx < (D_TARGET_PREFIX_LEN - p_idx)) {
                     match = false;
                 } else {
                     for(int i = 0; i < D_TARGET_SUFFIX_LEN; i++) {
@@ -270,6 +284,14 @@ __global__ void solana_vanity_kernel(fe base_seed, uint64_t *d_found_secret, cha
 }
 
 int main(int argc, char **argv) {
+    // FIX: Decoupled device routing block assigns independent cards cleanly
+    if (argc >= 4) {
+        int target_device_id = atoi(argv[3]);
+        cudaSetDevice(target_device_id);
+    } else {
+        cudaSetDevice(0); 
+    }
+
     srand(time(NULL));
     fe base_seed = { ((uint64_t)rand() << 32) | rand(), ((uint64_t)rand() << 32) | rand(), ((uint64_t)rand() << 32) | rand(), ((uint64_t)rand() << 32) | rand() };
 
@@ -283,8 +305,9 @@ int main(int argc, char **argv) {
     uint8_t *d_found_pubkey;
     char *d_found_address;
 
-    int threads_per_block = 128;
-    int blocks_per_grid = 4096; 
+    // FIX: Optimized single-card grid saturation geometry (4.1M keys per loop)
+    int threads_per_block = 256;
+    int blocks_per_grid = 16384; 
     uint64_t keys_per_loop = (uint64_t)threads_per_block * blocks_per_grid; 
 
     cudaMalloc((void**)&d_match_flag, sizeof(int));
@@ -295,14 +318,18 @@ int main(int argc, char **argv) {
     int total_filter_chars = 0;
 
     #if DYNAMIC_MODE == 1
-        if (argc != 3) {
+        // FIX: Expanded check accommodates multi-instance device_id args
+        if (argc < 3) {
             printf("[\033[1;31mERROR\033[0m] Invalid params for DYNAMIC_MODE.\n");
             return 1;
         }
 
         int prefix_len = strlen(argv[1]);
         int suffix_len = strlen(argv[2]);
-        total_filter_chars = prefix_len + suffix_len;
+        
+        int p_calc = (strcmp(argv[1], "-") == 0) ? 0 : prefix_len;
+        int s_calc = (strcmp(argv[2], "-") == 0) ? 0 : suffix_len;
+        total_filter_chars = p_calc + s_calc;
         
         cudaMemcpyToSymbol(D_TARGET_PREFIX, argv[1], prefix_len * sizeof(char));
         cudaMemcpyToSymbol(D_TARGET_PREFIX_LEN, &prefix_len, sizeof(int));
@@ -316,12 +343,11 @@ int main(int argc, char **argv) {
         printf("Execution Profile : \033[1;33m[PHANTOM COMPATIBLE / HARDCODED SILICON]\033[0m\n");
     #endif
 
-    // --- INITIALIZE MARKOV CONSTANT BOUNDARIES ON HOST ---
     uint64_t h_markov_mask[58];
     for(int i = 0; i < 58; i++) {
-        h_markov_mask[i] = ~0ULL; // Default to wide-open parameters (All transitions legal)
+        h_markov_mask[i] = ~0ULL; 
     }
-    int heuristic_enabled = 0; // Starts unconstrained until explicitly overwritten via IPC/C2 arrays
+    int heuristic_enabled = 0; 
 
     cudaMemcpyToSymbol(D_MARKOV_HEURISTIC_MASK, h_markov_mask, 58 * sizeof(uint64_t));
     cudaMemcpyToSymbol(D_HEURISTIC_ACTIVE, &heuristic_enabled, sizeof(int));
@@ -400,7 +426,6 @@ int main(int argc, char **argv) {
         clock_gettime(CLOCK_MONOTONIC, &step_end);
         double elapsed_step_seconds = (step_end.tv_sec - step_start.tv_sec) + (step_end.tv_nsec - step_start.tv_nsec) / 1e9;
 
-        // --- Live updates pushed down to 1.0 second intervals ---
         if (elapsed_step_seconds >= 1.0) {
             update_block_index++;
             double total_elapsed_run = (step_end.tv_sec - global_start.tv_sec) + (step_end.tv_nsec - global_start.tv_nsec) / 1e9;
@@ -420,7 +445,6 @@ int main(int argc, char **argv) {
             format_commas_double(current_speed_mhs, str_speed);
             format_commas(total_keys_processed, str_volume);
 
-            // Beautiful terminal interface layout
             printf("--- [MONITOR UPDATE BLOCK #%u] -----------------------------------------\n", update_block_index);
             printf(" Time.Elapsed.....: %s\n", str_elapsed);
             printf(" Hardware.Status..: True SHA-512 Protocol Active.\n");
@@ -430,11 +454,9 @@ int main(int argc, char **argv) {
             printf(" Average.ETA......: %s per valid match\n", str_eta);
             printf("------------------------------------------------------------------------\n");
             
-            // Machine parsable telemetry token string for the Python daemon framework
             printf("[TELEMETRY] %llu %.0f %.6f %.2f\n", total_keys_processed, current_speed_hz, probability_percent, average_eta_seconds);
             printf("========================================================================\n\n");
 
-            // Flush streams instantly so node/python sub-processes intercept values mid-execution
             fflush(stdout);
 
             last_reported_keys = total_keys_processed;

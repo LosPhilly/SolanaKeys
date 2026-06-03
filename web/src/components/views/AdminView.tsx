@@ -4,6 +4,7 @@ import { useState, useEffect, useMemo } from "react";
 import { supabase } from "../../utils/supabase";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { SystemProgram, Transaction, PublicKey, LAMPORTS_PER_SOL } from "@solana/web3.js";
+import bs58 from "bs58";
 import { 
   ShieldAlert, Trash2, Activity, Database, Lock, RefreshCcw, 
   LayoutDashboard, Store, ArrowRightLeft, Settings, Cpu, 
@@ -13,7 +14,7 @@ import {
 
 export default function AdminView() {
   const { connection } = useConnection();
-  const { publicKey, sendTransaction } = useWallet();
+  const { publicKey, sendTransaction, signMessage } = useWallet();
   
   // Data State
   const [inventory, setInventory] = useState<any[]>([]);
@@ -79,21 +80,30 @@ export default function AdminView() {
   };
 
   const handleBurn = async (id: string, table: 'premium_inventory' | 'vanity_jobs') => {
+    if (!publicKey || !signMessage) {
+      alert("Wallet not connected or does not support message signing.");
+      return;
+    }
+
     if (!confirm("CRITICAL WARNING: This will permanently delete this key from the database. It cannot be undone.")) return;
-    
-    const passphrase = prompt("ENTER MASTER BURNING PASSPHRASE:");
-    if (!passphrase) return;
-    
+
     setProcessingId(id);
     try {
+      // Sign a deterministic message that commits to exactly this action.
+      // The server verifies this signature — no passphrase needed.
+      const msgStr = `Authenticate to SolanaKeys Admin.\nAction: BURN\nItem ID: ${id}\nTable: ${table}`;
+      const sigBytes = await signMessage(new TextEncoder().encode(msgStr));
+      const signature = bs58.encode(sigBytes);
+
       const response = await fetch('/api/admin/burn', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           itemId: id,
-          table: table,
-          adminWallet: publicKey?.toBase58(),
-          passphrase: passphrase
+          table,
+          adminWallet: publicKey.toBase58(),
+          message: msgStr,
+          signature,
         }),
       });
 
@@ -101,11 +111,15 @@ export default function AdminView() {
         const err = await response.json();
         throw new Error(err.error || "Burn command rejected by server.");
       }
-      
+
       await fetchAllData();
     } catch (error: any) {
-      console.error(error);
-      alert(`Failed: ${error.message}`);
+      if (error.message?.includes("User rejected") || error.message?.includes("rejected the request")) {
+        // Admin cancelled the signing prompt — silent
+      } else {
+        console.error(error);
+        alert(`Failed: ${error.message}`);
+      }
     } finally {
       setProcessingId(null);
     }

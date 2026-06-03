@@ -1,11 +1,12 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useWallet, useConnection } from "@solana/wallet-adapter-react";
 import { LAMPORTS_PER_SOL, Transaction, SystemProgram, PublicKey } from "@solana/web3.js";
 import { supabase } from "../../utils/supabase";
 import bs58 from "bs58";
+import { sha256 } from "@noble/hashes/sha256";
 import { Activity, Key, Trash2, AlertTriangle, Copy, Check, Eye, EyeOff, Wallet, Zap, Hash, Clock, XCircle, Timer, Percent, Lock, Coins, ShieldCheck, ShoppingCart, ArrowRight, Tags, ArrowRightLeft, Info } from "lucide-react";
 
 import nacl from "tweetnacl";
@@ -68,6 +69,8 @@ export default function VaultView() {
   const [listingJobId, setListingJobId] = useState<string | null>(null);
   const [listingPrice, setListingPrice] = useState<string>("0.15");
   const [isListing, setIsListing] = useState(false);
+
+  const copyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     if (connected && publicKey) {
@@ -168,18 +171,28 @@ export default function VaultView() {
     setIsUnlocking(true);
     try {
       const walletAddress = publicKey.toBase58();
-      const messageStr = `Authenticate to SolanaKeys.\nAction: FETCH_COMPLETED_KEYS\nWallet: ${walletAddress}`;
-      const messageBytes = new TextEncoder().encode(messageStr);
+      
+      const authMessageStr = 
+        `[SolanaKeys Official Vault Authentication]\n` +
+        `Domain: solanakeys.com\n` +
+        `Wallet: ${walletAddress}\n` +
+        `Purpose: Derive End-to-End Encryption key for secure vault access.\n` +
+        `Security Notice: Never sign this message on any domain other than solanakeys.com. If signed elsewhere, malicious software can expose historical secrets.`;
+        
+      const messageBytes = new TextEncoder().encode(authMessageStr);
 
       const signatureBytes = await signMessage(messageBytes);
       const signatureBase58 = bs58.encode(signatureBytes);
 
       const response = await fetch('/api/vault/fetch', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Wallet-Address': publicKey.toBase58(),
+        },
         body: JSON.stringify({
           publicKey: walletAddress,
-          message: messageStr,
+          message: authMessageStr,
           signature: signatureBase58
         })
       });
@@ -191,15 +204,13 @@ export default function VaultView() {
 
       const result = await response.json();
 
-      const secretKeyBase64 = localStorage.getItem(`solana_keys_secret_${walletAddress}`);
-      let ephemeralKeyPair: nacl.BoxKeyPair | null = null;
-      
-      if (secretKeyBase64) {
-        const secretKeyUint8 = util.decodeBase64(secretKeyBase64);
-        ephemeralKeyPair = nacl.box.keyPair.fromSecretKey(secretKeyUint8);
-      } else {
-        console.warn("NO LOCAL BROWSER KEY FOUND! Keys will remain encrypted.");
-      }
+      // RECONSTRUCT THE DETERMINISTIC SEED
+      const hasher = sha256.create();
+      hasher.update(signatureBytes);
+      hasher.update(new TextEncoder().encode("SolanaKeys_Internal_App_Pepper_v1"));
+      const cleanSeed32 = hasher.digest();
+
+      const ephemeralKeyPair = nacl.box.keyPair.fromSecretKey(cleanSeed32);
 
       const formattedKeys = result.keys
         .filter((job: any) => !job.is_listed) 
@@ -211,28 +222,28 @@ export default function VaultView() {
             try {
               const ciphertextUint8 = util.decodeBase64(job.result_payload);
               const decryptedBytes = sealedBox.open(
-                ciphertextUint8, 
-                ephemeralKeyPair.publicKey, 
+                ciphertextUint8,
+                ephemeralKeyPair.publicKey,
                 ephemeralKeyPair.secretKey
               );
-              
               if (decryptedBytes) {
-                finalPrivateKey = util.encodeUTF8(decryptedBytes);
+                // Strip null bytes and whitespace from C++ / Python output
+                finalPrivateKey = util.encodeUTF8(decryptedBytes).replace(/\0/g, '').trim();
               } else {
-                throw new Error("Mathematical rejection");
+                decryptionFailed = true;
               }
             } catch (e) {
-              console.error(`Decryption failed for job ${job.id}. Key rotation mismatch.`);
+              console.error(`Decryption failed for job ${job.id}:`, e);
               decryptionFailed = true;
             }
           } else {
-             decryptionFailed = true;
+            decryptionFailed = true;
           }
 
           return {
             id: job.id,
             publicKey: job.result_address,
-            privateKey: decryptionFailed ? `[ENCRYPTED] ${finalPrivateKey}` : finalPrivateKey,
+            privateKey: decryptionFailed ? null : finalPrivateKey,
             prefix: job.prefix,
             suffix: job.suffix,
             isRevealed: job.is_revealed || false,
@@ -262,17 +273,28 @@ export default function VaultView() {
       const confirmed = window.confirm("Warning: Revealing this private key will permanently ban it from being listed on the P2P Exchange. Do you wish to proceed?");
       if (!confirmed) return;
 
+      if (!signMessage) { alert("Wallet does not support signing."); return; }
       try {
-        const { error } = await (supabase.from('vanity_jobs') as any)
-          .update({ is_revealed: true })
-          .eq('id', key.id);
-
-        if (error) throw error;
-
+        const msgStr = `Authenticate to SolanaKeys.\nAction: REVEAL\nJob ID: ${key.id}`;
+        const sigBytes = await signMessage(new TextEncoder().encode(msgStr));
+        const res = await fetch('/api/vault/reveal', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Wallet-Address': publicKey!.toBase58(),
+          },
+          body: JSON.stringify({
+            jobId: key.id,
+            publicKey: publicKey!.toBase58(),
+            message: msgStr,
+            signature: bs58.encode(sigBytes),
+          }),
+        });
+        if (!res.ok) { const e = await res.json(); throw new Error(e.error || "Failed to reveal."); }
         setCompletedKeys(keys => keys.map(k => k.id === key.id ? { ...k, isRevealed: true } : k));
-      } catch (e) {
+      } catch (e: any) {
         console.error("Failed to mark key as revealed:", e);
-        alert("Failed to reveal key. Please try again.");
+        alert(e.message || "Failed to reveal key. Please try again.");
         return;
       }
     }
@@ -285,20 +307,33 @@ export default function VaultView() {
       const confirmed = window.confirm("Warning: Copying this private key will permanently ban it from being listed on the P2P Exchange. Do you wish to proceed?");
       if (!confirmed) return;
 
+      if (!signMessage) { alert("Wallet does not support signing."); return; }
       try {
-        const { error } = await (supabase.from('vanity_jobs') as any)
-          .update({ is_revealed: true })
-          .eq('id', key.id);
-
-        if (error) throw error;
+        const msgStr = `Authenticate to SolanaKeys.\nAction: REVEAL\nJob ID: ${key.id}`;
+        const sigBytes = await signMessage(new TextEncoder().encode(msgStr));
+        const res = await fetch('/api/vault/reveal', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Wallet-Address': publicKey!.toBase58(),
+          },
+          body: JSON.stringify({
+            jobId: key.id,
+            publicKey: publicKey!.toBase58(),
+            message: msgStr,
+            signature: bs58.encode(sigBytes),
+          }),
+        });
+        if (!res.ok) { const e = await res.json(); throw new Error(e.error || "Failed to update."); }
         setCompletedKeys(keys => keys.map(k => k.id === key.id ? { ...k, isRevealed: true } : k));
-      } catch (e) {
+      } catch (e: any) {
         console.error("Failed to secure copy update:", e);
-        alert("Network error. Could not copy safely.");
+        alert(e.message || "Network error. Could not copy safely.");
         return;
       }
     }
 
+    if (!key.privateKey) { alert("Key is unavailable — decryption may have failed."); return; }
     copyToClipboard(key.privateKey, copyId);
   };
 
@@ -324,7 +359,7 @@ export default function VaultView() {
         SystemProgram.transfer({
           fromPubkey: publicKey,
           toPubkey: new PublicKey(adminWalletStr),
-          lamports: 0.025 * LAMPORTS_PER_SOL,
+          lamports: Math.round(0.025 * LAMPORTS_PER_SOL),
         })
       );
 
@@ -336,15 +371,20 @@ export default function VaultView() {
       const signature = await sendTransaction(transaction, connection, { minContextSlot });
       await connection.confirmTransaction({ blockhash, lastValidBlockHeight, signature });
 
+      // SECURITY: rawPrivateKey is intentionally NOT sent here.
+      // The server re-encrypts the key from its own escrow store using jobId.
+      // The client never transmits a plaintext private key over the wire.
       const response = await fetch('/api/exchange/list', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Wallet-Address': publicKey.toBase58(),
+        },
         body: JSON.stringify({
           jobId: key.id,
           userWallet: publicKey.toBase58(),
-          rawPrivateKey: key.privateKey,
           priceSol: priceNum,
-          paymentSignature: signature 
+          paymentSignature: signature,
         })
       });
 
@@ -379,7 +419,10 @@ export default function VaultView() {
 
       const response = await fetch('/api/vault/purge', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Wallet-Address': publicKey.toBase58(),
+        },
         body: JSON.stringify({
           jobId: id,
           publicKey: publicKey.toBase58(),
@@ -403,9 +446,6 @@ export default function VaultView() {
     }
   };
 
-  // -----------------------------------------------------
-  // NEW: SECURE CANCELLATION API CALL WITH REFUNDS
-  // -----------------------------------------------------
   const cancelJob = async (id: string) => {
     if (!publicKey || !signMessage) {
       alert("Wallet not connected or does not support signing.");
@@ -421,17 +461,18 @@ export default function VaultView() {
     if (!window.confirm(warningMessage)) return;
 
     try {
-      // 1. Prompt user to sign the cancellation request to prove ownership
       const messageStr = `Authenticate to SolanaKeys.\nAction: CANCEL_AND_REFUND\nJob ID: ${id}`;
       const messageBytes = new TextEncoder().encode(messageStr);
 
       const signatureBytes = await signMessage(messageBytes);
       const signatureBase58 = bs58.encode(signatureBytes);
 
-      // 2. Send the verified request to the backend API
       const response = await fetch('/api/jobs/cancel', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Wallet-Address': publicKey.toBase58(),
+        },
         body: JSON.stringify({
           jobId: id,
           userWallet: publicKey.toBase58(),
@@ -448,18 +489,24 @@ export default function VaultView() {
       
       alert(`Job cancelled successfully! A refund of ${data.refundAmount?.toFixed(4) || 0} SOL has been routed back to your wallet.`);
       
-      // Update local UI state to remove the cancelled job
       setActiveJobs(activeJobs.filter(job => job.id !== id));
 
     } catch (error: any) {
-      console.error("Cancellation error:", error);
-      alert(error.message || "An unexpected error occurred during cancellation.");
+      const msg = error?.message || "";
+      if (msg.includes("WalletDisconnected") || msg.includes("wallet disconnected") || msg.includes("Wallet disconnected")) {
+        // Phantom disconnected during the wait — refund was sent, this is cosmetic
+        console.warn("Wallet disconnected after refund was sent — this is safe to ignore.");
+      } else {
+        console.error("Cancellation error:", error);
+        alert(msg || "An unexpected error occurred during cancellation.");
+      }
     }
   };
 
   const copyToClipboard = (text: string, id: string) => {
+    if (copyTimeoutRef.current) clearTimeout(copyTimeoutRef.current);
     setCopiedId(id);
-    setTimeout(() => setCopiedId(null), 2500);
+    copyTimeoutRef.current = setTimeout(() => setCopiedId(null), 2500);
 
     const executeCopy = async () => {
       try {
@@ -847,11 +894,12 @@ export default function VaultView() {
                       <input 
                         type="text" 
                         readOnly 
-                        value={key.decryptionFailed ? key.privateKey : (revealKey === key.id ? key.privateKey : "••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••")} 
-                        className={`bg-transparent border-none outline-none font-mono text-sm w-full cursor-text select-text ${revealKey === key.id || key.decryptionFailed ? 'text-foreground' : 'text-zinc-500 tracking-[0.2em] md:tracking-[0.5em]'}`}
+                        // If not revealed, always mask in bullets
+                        value={revealKey === key.id ? key.privateKey : "••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••"} 
+                        className={`bg-transparent border-none outline-none font-mono text-sm w-full cursor-text select-text ${revealKey === key.id ? 'text-foreground' : 'text-zinc-500 tracking-[0.2em] md:tracking-[0.5em]'}`}
                         onClick={(e) => e.currentTarget.select()}
                       />
-                      {(revealKey === key.id || key.decryptionFailed) && (
+                      {revealKey === key.id && (
                          <button onClick={() => handleSecureCopy(key, `${key.id}-priv`)} className="text-zinc-400 hover:text-purple-500 transition-colors p-1.5 rounded-md ml-2 shrink-0 active:scale-90 bg-card hover:bg-purple-50 dark:hover:bg-purple-500/10 border border-card-border" title="Copy Private Key">
                            {copiedId === `${key.id}-priv` ? <Check size={18} className="text-green-500 animate-in zoom-in duration-200" /> : <Copy size={18} className="transition-transform" />}
                          </button>

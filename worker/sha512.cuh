@@ -9,7 +9,7 @@
 // VERIFIED FIX: Pure C++ Rotation. Bypasses buggy PTX inline assembly.
 #define ROTR64(x, n) (((x) >> (n)) | ((x) << (64 - (n))))
 
-#define CH(x, y, z)  (((x) & (y)) ^ (~(x) & (z)))
+#define CH(x, y, z)   (((x) & (y)) ^ (~(x) & (z)))
 #define MAJ(x, y, z) (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
 
 #define EP0(x) (ROTR64(x, 28) ^ ROTR64(x, 34) ^ ROTR64(x, 39))
@@ -18,23 +18,20 @@
 #define SIG1(x) (ROTR64(x, 19) ^ ROTR64(x, 61) ^ ((x) >> 6))
 
 // ------------------------------------------------------------------------
-// HARDWARE INTRINSIC: HIGH-SPEED PTX BYTE-SWAP (PERMUTE ACCELERATED)
+// HARDWARE INTRINSIC: HIGH-SPEED BYTESWAP (PURE C++ OPTIMIZED)
 // ------------------------------------------------------------------------
-// Replaces the manual 24-instruction bit-shifting routine with a 
-// 2-cycle hardware permute engine, bypassing ALU shift constraints.
+// Replaced the broken PTX inline assembly. NVCC will automatically 
+// optimize this pattern into native hardware permutation instructions.
 __device__ __forceinline__ uint64_t bswap_64(uint64_t x) {
-    uint32_t lo = (uint32_t)x;
-    uint32_t hi = (uint32_t)(x >> 32);
-    
-    uint32_t rev_lo, rev_hi;
-
-    // prmt.b32 selects bytes from its inputs based on a 16-bit control mask.
-    // Index 0x0123 extracts and flips bytes 3, 2, 1, 0 in a single clock cycle.
-    asm volatile("prmt.b32 %0, %1, 0, 0x0123;" : "=r"(rev_lo) : "r"(lo));
-    asm volatile("prmt.b32 %0, %1, 0, 0x0123;" : "=r"(rev_hi) : "r"(hi));
-
-    // Combine back into a 64-bit lane, swapping high and low registers
-    return ((uint64_t)rev_lo << 32) | rev_hi;
+    return
+        ((x & 0xFF00000000000000ULL) >> 56) |
+        ((x & 0x00FF000000000000ULL) >> 40) |
+        ((x & 0x0000FF0000000000ULL) >> 24) |
+        ((x & 0x000000FF00000000ULL) >>  8) |
+        ((x & 0x00000000FF000000ULL) <<  8) |
+        ((x & 0x0000000000FF0000ULL) << 24) |
+        ((x & 0x000000000000FF00ULL) << 40) |
+        ((x & 0x00000000000000FFULL) << 56);
 }
 
 // ------------------------------------------------------------------------
@@ -72,7 +69,7 @@ __device__ __forceinline__ void sha512_32bytes(const uint8_t* in_seed, uint8_t* 
 
     uint64_t W[16];
     
-    // Standard Big-Endian Data Ingestion (Accelerated via PTX Byte-Swap)
+    // Standard Big-Endian Data Ingestion (Accelerated via Byte-Swap)
     const uint64_t* in64 = (const uint64_t*)in_seed;
     W[0] = bswap_64(in64[0]);
     W[1] = bswap_64(in64[1]);
@@ -175,7 +172,7 @@ __device__ __forceinline__ void sha512_32bytes(const uint8_t* in_seed, uint8_t* 
     ROUND_EXPAND(c, d, e, f, g, h, a, b, 78, 0x5fcb6fab3ad6faec);
     ROUND_EXPAND(b, c, d, e, f, g, h, a, 79, 0x6c44198c4a475817);
 
-    // Standard Little-Endian Output Conversion (Accelerated via PTX Byte-Swap)
+    // Standard Little-Endian Output Conversion (Accelerated via Byte-Swap)
     uint64_t* out64 = (uint64_t*)out_hash;
     out64[0] = bswap_64(a + 0x6a09e667f3bcc908);
     out64[1] = bswap_64(b + 0xbb67ae8584caa73b);

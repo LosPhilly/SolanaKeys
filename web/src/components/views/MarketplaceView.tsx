@@ -7,6 +7,7 @@ import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { SystemProgram, Transaction, PublicKey, LAMPORTS_PER_SOL } from "@solana/web3.js";
 import nacl from "tweetnacl";
 import util from "tweetnacl-util";
+import { sha256 } from "@noble/hashes/sha256";
 
 export default function MarketplaceView() {
   const [inventory, setInventory] = useState<any[]>([]);
@@ -17,7 +18,7 @@ export default function MarketplaceView() {
   const itemsPerPage = 9;
 
   const { connection } = useConnection();
-  const { publicKey, sendTransaction } = useWallet();
+  const { publicKey, sendTransaction, signMessage } = useWallet();
   const [processingId, setProcessingId] = useState<string | null>(null);
 
   const adminWalletEnv = process.env.NEXT_PUBLIC_ADMIN_WALLET;
@@ -47,19 +48,40 @@ export default function MarketplaceView() {
   };
 
   const handlePurchase = async (item: any) => {
-    if (!publicKey) {
-      alert("Please connect your wallet first to purchase.");
+    if (!publicKey || !signMessage) {
+      alert("Please connect a wallet that supports message signing to purchase.");
       return;
     }
 
     try {
       setProcessingId(item.id);
 
+      // 1. STATELESS DETERMINISTIC ENCRYPTION HANDSHAKE
+      // Triggered BEFORE payment so no funds are lost if the user cancels the prompt
+      const authMessageStr = 
+        `[SolanaKeys Official Vault Authentication]\n` +
+        `Domain: solanakeys.com\n` +
+        `Wallet: ${publicKey.toBase58()}\n` +
+        `Purpose: Derive End-to-End Encryption key for secure vault access.\n` +
+        `Security Notice: Never sign this message on any domain other than solanakeys.com. If signed elsewhere, malicious software can expose historical secrets.`;
+
+      const messageBytes = new TextEncoder().encode(authMessageStr);
+      const signatureBytes = await signMessage(messageBytes);
+
+      const hasher = sha256.create();
+      hasher.update(signatureBytes);
+      hasher.update(new TextEncoder().encode("SolanaKeys_Internal_App_Pepper_v1"));
+      const cleanSeed32 = hasher.digest();
+
+      const ephemeralKeyPair = nacl.box.keyPair.fromSecretKey(cleanSeed32);
+      const publicKeyBase64 = util.encodeBase64(ephemeralKeyPair.publicKey);
+      
+      // 2. ON-CHAIN PAYMENT
       const transaction = new Transaction().add(
         SystemProgram.transfer({
           fromPubkey: publicKey,
           toPubkey: MERCHANT_WALLET,
-          lamports: item.price_sol * LAMPORTS_PER_SOL,
+          lamports: Math.round(item.price_sol * LAMPORTS_PER_SOL),
         })
       );
 
@@ -75,28 +97,17 @@ export default function MarketplaceView() {
         lastValidBlockHeight
       }, 'confirmed');
 
-      // --- NEW: PERSISTENT ZERO KNOWLEDGE ENCRYPTION HANDSHAKE ---
-      let secretKeyBase64 = localStorage.getItem(`solana_keys_secret_${publicKey.toBase58()}`);
-      let publicKeyBase64 = localStorage.getItem(`solana_keys_pub_${publicKey.toBase58()}`);
-
-      if (!secretKeyBase64 || !publicKeyBase64) {
-        const ephemeralKeyPair = nacl.box.keyPair();
-        publicKeyBase64 = util.encodeBase64(ephemeralKeyPair.publicKey);
-        secretKeyBase64 = util.encodeBase64(ephemeralKeyPair.secretKey);
-        
-        localStorage.setItem(`solana_keys_secret_${publicKey.toBase58()}`, secretKeyBase64);
-        localStorage.setItem(`solana_keys_pub_${publicKey.toBase58()}`, publicKeyBase64);
-      }
-      // -----------------------------------------------------------
-
+      // 3. SECURE HANDOVER API CALL — include blockhash so server can re-confirm
       const response = await fetch('/api/marketplace/purchase', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           signature,
+          blockhash,
+          lastValidBlockHeight,
           userWallet: publicKey.toBase58(),
           itemId: item.id,
-          clientPubkey: publicKeyBase64 
+          clientPubkey: publicKeyBase64,
         }),
       });
 

@@ -18,10 +18,16 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Missing authentication payload' }, { status: 400 });
     }
 
-    // 1. Reconstruct and validate the exact action message string
-    const expectedMessage = `Authenticate to SolanaKeys.\nAction: FETCH_COMPLETED_KEYS\nWallet: ${publicKey}`;
+    // 1. Reconstruct and validate the EXACT new action message string
+    const expectedMessage = 
+      `[SolanaKeys Official Vault Authentication]\n` +
+      `Domain: solanakeys.com\n` +
+      `Wallet: ${publicKey}\n` +
+      `Purpose: Derive End-to-End Encryption key for secure vault access.\n` +
+      `Security Notice: Never sign this message on any domain other than solanakeys.com. If signed elsewhere, malicious software can expose historical secrets.`;
+
     if (message !== expectedMessage) {
-      return NextResponse.json({ error: 'Invalid challenge message handshake' }, { status: 403 });
+      return NextResponse.json({ error: 'invalid challenge message handshake' }, { status: 403 });
     }
 
     // 2. Cryptographically verify the signature matches the claimed wallet
@@ -36,7 +42,6 @@ export async function POST(req: Request) {
     }
 
     // 3. Signature is authentic. Fetch only completed assets for this specific wallet identity.
-    // --> ADDED: is_revealed and is_listed to the select string
     const { data: completedJobs, error } = await supabase
       .from('vanity_jobs')
       .select('id, prefix, suffix, target_length, result_address, result_payload, completed_at, status, is_revealed, is_listed')
