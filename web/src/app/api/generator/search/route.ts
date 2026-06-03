@@ -32,9 +32,9 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Missing Zero-Knowledge Encryption Lock' }, { status: 400 });
     }
 
-    if (!blockhash || !lastValidBlockHeight) {
-      return NextResponse.json({ error: 'Missing transaction confirmation parameters (blockhash / lastValidBlockHeight).' }, { status: 400 });
-    }
+    // blockhash/lastValidBlockHeight accepted for client compatibility but not used
+    // server-side — confirmTransaction uses WebSocket which 401s on restricted RPC keys.
+    // Client confirms before POSTing; we fetch the confirmed tx directly instead.
 
     // --- HARD SERVER-SIDE VALIDATION & INPUT SANITIZATION ---
     const cleanPrefix = (prefix || '').replace(/[^1-9A-HJ-NP-Za-km-z]/g, '');
@@ -59,8 +59,6 @@ export async function POST(req: Request) {
     // ---------------------------------------------------------
 
     // DUPLICATE JOB GUARD — check server-side before payment is accepted into the queue.
-    // Prevents double-click or rapid retry from creating two paid jobs simultaneously.
-    // Note: GeneratorView also checks this client-side, but the server is the real gate.
     const { data: activeJobs, error: activeCheckError } = await supabase
       .from('vanity_jobs')
       .select('id, status, prefix, suffix')
@@ -77,7 +75,7 @@ export async function POST(req: Request) {
       }, { status: 409 });
     }
 
-    // Also guard against signature replay — reject if this exact tx was already used
+    // Signature replay guard
     const { data: sigCheck } = await supabase
       .from('vanity_jobs')
       .select('id')
@@ -89,31 +87,24 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'This payment signature has already been used.' }, { status: 409 });
     }
 
-    // --- CONFIRM PAYMENT ON-CHAIN ---
-    console.log(`[routeSearch] Confirming payment tx: ${signature}`);
-    try {
-      const result = await connection.confirmTransaction(
-        { signature, blockhash, lastValidBlockHeight },
-        'confirmed'
-      );
-      if (result.value.err) {
-        console.error('[routeSearch] Transaction failed on-chain:', result.value.err);
-        return NextResponse.json({ error: 'Payment transaction failed on-chain.' }, { status: 400 });
-      }
-    } catch (confirmErr: any) {
-      console.error('[routeSearch] confirmTransaction error:', confirmErr.message);
-      return NextResponse.json({ error: 'Payment transaction could not be confirmed. It may have expired — please try again.' }, { status: 400 });
+    // --- FETCH CONFIRMED PAYMENT TX ---
+    // Client already confirmed before POSTing. We skip confirmTransaction (uses WebSocket,
+    // returns 401 on restricted RPC keys) and fetch the confirmed tx directly instead.
+    console.log(`[routeSearch] Fetching confirmed payment tx: ${signature}`);
+    let tx = null;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      tx = await connection.getParsedTransaction(signature, {
+        maxSupportedTransactionVersion: 0,
+        commitment: 'confirmed',
+      });
+      if (tx) break;
+      await new Promise(r => setTimeout(r, 2000));
     }
-
-    const tx = await connection.getParsedTransaction(signature, {
-      maxSupportedTransactionVersion: 0,
-      commitment: 'confirmed',
-    });
 
     if (!tx || tx.meta?.err) {
       return NextResponse.json({ error: 'Could not retrieve confirmed transaction details.' }, { status: 400 });
     }
-    // --------------------------------
+    // ----------------------------------
 
     const expectedLamports = Math.round(priceSol * 1_000_000_000);
     let paymentValid = false;

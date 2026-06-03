@@ -13,7 +13,6 @@ import nacl from "tweetnacl";
 import util from "tweetnacl-util";
 import sealedBox from "tweetnacl-sealedbox-js";
 
-
 const WalletMultiButton = dynamic(
   () => import("@solana/wallet-adapter-react-ui").then((mod) => mod.WalletMultiButton),
   { ssr: false }
@@ -386,7 +385,9 @@ export default function VaultView() {
           userWallet: publicKey.toBase58(),
           priceSol: priceNum,
           paymentSignature: signature,
-        })
+          blockhash,
+          lastValidBlockHeight,
+        }),
       });
 
       if (!response.ok) {
@@ -495,8 +496,7 @@ export default function VaultView() {
     } catch (error: any) {
       const msg = error?.message || "";
       if (msg.includes("WalletDisconnected") || msg.includes("wallet disconnected") || msg.includes("Wallet disconnected")) {
-        // Phantom disconnected during the wait — refund was sent, this is cosmetic
-        console.warn("Wallet disconnected after refund was sent — this is safe to ignore.");
+        console.warn("Wallet disconnected after refund was sent — safe to ignore.");
       } else {
         console.error("Cancellation error:", error);
         alert(msg || "An unexpected error occurred during cancellation.");
