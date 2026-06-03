@@ -10,8 +10,10 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY!
 );
 
-const rpcUrl = process.env.NEXT_PUBLIC_SOLANA_RPC_URL || 'https://api.devnet.solana.com';
-const connection = new Connection(rpcUrl, 'confirmed');
+const connection = new Connection(
+  process.env.SERVER_SOLANA_RPC_URL || process.env.NEXT_PUBLIC_SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com',
+  'confirmed'
+);
 const EXPECTED_MERCHANT_WALLET = process.env.NEXT_PUBLIC_ADMIN_WALLET;
 
 export async function POST(req: Request) {

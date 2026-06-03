@@ -5,7 +5,10 @@ import nacl from 'tweetnacl';
 import bs58 from 'bs58';
 
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_KEY!);
-const connection = new Connection(process.env.NEXT_PUBLIC_SOLANA_RPC_URL || "https://api.devnet.solana.com", "confirmed");
+const connection = new Connection(
+  process.env.SERVER_SOLANA_RPC_URL || process.env.NEXT_PUBLIC_SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com',
+  'confirmed'
+);
 
 export async function POST(req: Request) {
   try {

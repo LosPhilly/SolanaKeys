@@ -2,8 +2,10 @@ import { NextResponse } from 'next/server';
 import { Connection } from '@solana/web3.js';
 import { createClient } from '@supabase/supabase-js';
 
-const rpcUrl = process.env.NEXT_PUBLIC_SOLANA_RPC_URL || 'https://api.devnet.solana.com';
-const connection = new Connection(rpcUrl, 'confirmed');
+const connection = new Connection(
+  process.env.SERVER_SOLANA_RPC_URL || process.env.NEXT_PUBLIC_SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com',
+  'confirmed'
+);
 
 const supabase = createClient(
   process.env.SUPABASE_URL!,
