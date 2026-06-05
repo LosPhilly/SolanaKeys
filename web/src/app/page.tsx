@@ -63,13 +63,13 @@ export default function Home() {
         {/* SEO IMAGE INSERTION */}
         <div className="mb-12 flex justify-center animate-in fade-in zoom-in duration-500">
            <Image 
-             src="/images/sk_seo.jpg"
-             alt="SolanaKeys GPU-accelerated vanity address generator"
-             width={1200}
-             height={630}
-             className="rounded-2xl shadow-2xl border border-card-border max-w-full h-auto"
-             priority
-           />
+              src="/images/solana-vanity-address-generator.jpg" // Updated to match your new filename
+              alt="SolanaKeys GPU Vanity Address Generator"
+              width={1200}
+              height={630}
+              className="rounded-2xl shadow-2xl border border-card-border max-w-full h-auto"
+              priority
+            />
         </div>
 
         {/* NAVIGATION TABS */}
