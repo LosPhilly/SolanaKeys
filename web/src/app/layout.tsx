@@ -20,6 +20,14 @@ export const metadata: Metadata = {
     description: 'Instantly generate custom Solana wallets. Zero-knowledge E2EE encryption, blistering GPU hash rates, and fully stateless deterministic key delivery.',
     url: 'https://solanakeys.com',
     siteName: 'SolanaKeys',
+    images: [
+      {
+        url: '/images/solana-vanity-address-generator.jpg', // Pointing to your public file
+        width: 1200,
+        height: 630,
+        alt: 'SolanaKeys GPU-accelerated vanity address generator',
+      },
+    ],
     locale: 'en_US',
     type: 'website',
   },
@@ -27,6 +35,7 @@ export const metadata: Metadata = {
     card: 'summary_large_image',
     title: 'SolanaKeys | GPU Vanity Generator',
     description: 'Generate cryptographically secure, custom Solana vanity addresses at bare-metal speeds.',
+    images: ['/images/solana-vanity-address-generator.jpg'], // Twitter also needs the path
   },
 };
 

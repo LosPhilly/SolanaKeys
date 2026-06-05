@@ -3,12 +3,13 @@
 import dynamic from "next/dynamic";
 import { useState, useEffect } from "react";
 import { useTheme } from "next-themes";
+import Image from "next/image"; // IMPORTED
 import { Zap, Moon, Sun, Monitor } from "lucide-react";
 
 import GeneratorView from "@/components/views/GeneratorView";
 import MarketplaceView from "@/components/views/MarketplaceView";
 import VaultView from "@/components/views/VaultView";
-import ExchangeView from "@/components/views/ExchangeView"; // IMPORT YOUR NEW VIEW
+import ExchangeView from "@/components/views/ExchangeView";
 
 const WalletMultiButton = dynamic(
   () => import("@solana/wallet-adapter-react-ui").then((mod) => mod.WalletMultiButton),
@@ -18,7 +19,6 @@ const WalletMultiButton = dynamic(
 export default function Home() {
   const { theme, setTheme } = useTheme();
   const [mounted, setMounted] = useState(false);
-  // ADD 'exchange' TO YOUR ALLOWED TAB STATES
   const [activeTab, setActiveTab] = useState<"create" | "marketplace" | "vault" | "exchange">("create");
 
   useEffect(() => setMounted(true), []);
@@ -60,12 +60,24 @@ export default function Home() {
           </div>
         </header>
 
+        {/* SEO IMAGE INSERTION */}
+        <div className="mb-12 flex justify-center animate-in fade-in zoom-in duration-500">
+           <Image 
+             src="/images/sk_seo.jpg"
+             alt="SolanaKeys GPU-accelerated vanity address generator"
+             width={1200}
+             height={630}
+             className="rounded-2xl shadow-2xl border border-card-border max-w-full h-auto"
+             priority
+           />
+        </div>
+
         {/* NAVIGATION TABS */}
         <div className="flex flex-wrap gap-3 mb-10">
           {[
             { id: "create", label: "Create Custom Address" },
             { id: "marketplace", label: "Instant Storefront" },
-            { id: "exchange", label: "P2P Exchange" }, // ADD THE EXCHANGE BUTTON HERE
+            { id: "exchange", label: "P2P Exchange" },
             { id: "vault", label: "My Vault" },
           ].map((tab) => (
             <button 
@@ -82,7 +94,7 @@ export default function Home() {
         <main className="relative">
           {activeTab === "create" && <GeneratorView onJobQueued={() => setActiveTab("vault")} />}
           {activeTab === "marketplace" && <MarketplaceView />}
-          {activeTab === "exchange" && <ExchangeView />} {/* ROUTE TO THE COMPONENT */}
+          {activeTab === "exchange" && <ExchangeView />}
           {activeTab === "vault" && <VaultView />}
         </main>
       </div>
