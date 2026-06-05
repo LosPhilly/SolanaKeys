@@ -3,8 +3,8 @@
 import dynamic from "next/dynamic";
 import { useState, useEffect } from "react";
 import { useTheme } from "next-themes";
-import Image from "next/image"; // IMPORTED
-import { Zap, Moon, Sun, Monitor } from "lucide-react";
+import Image from "next/image";
+import { Zap, Moon, Sun, Monitor, ArrowRight } from "lucide-react";
 
 import GeneratorView from "@/components/views/GeneratorView";
 import MarketplaceView from "@/components/views/MarketplaceView";
@@ -24,74 +24,72 @@ export default function Home() {
   useEffect(() => setMounted(true), []);
 
   return (
-    <div className="min-h-screen flex flex-col font-sans selection:bg-purple-500/30">
+    <div className="min-h-screen flex flex-col font-sans">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 w-full flex-grow">
         
         {/* HEADER */}
-        <header className="flex flex-col md:flex-row justify-between items-start md:items-center mb-10 gap-4 border-b border-card-border pb-6">
+        <header className="flex justify-between items-center mb-10 pb-6 border-b border-card-border">
           <div className="flex items-center gap-4">
-            <div className="h-12 w-12 bg-gradient-to-tr from-purple-600 to-indigo-600 rounded-xl flex items-center justify-center shadow-lg">
-              <Zap className="text-white" size={24} />
+            <div className="h-10 w-10 bg-gradient-to-tr from-purple-600 to-indigo-600 rounded-lg flex items-center justify-center">
+              <Zap className="text-white" size={20} />
             </div>
-            <div>
-              <h1 className="text-2xl font-black tracking-tight leading-none text-foreground">
-                SOLANA<span className="text-purple-600 dark:text-purple-500 font-light">KEYS</span>
-              </h1>
-              <p className="text-xs text-zinc-500 font-medium mt-1">Premium Vanity Address Generator</p>
-            </div>
+            <h1 className="text-xl font-black text-foreground">SOLANAKEYS</h1>
           </div>
-          <div className="flex items-center gap-4">
-            {mounted && (
-              <div className="flex bg-card border border-card-border rounded-lg p-1">
-                <button onClick={() => setTheme("light")} className={`p-2 rounded-md transition-colors cursor-pointer ${theme === "light" ? "bg-white dark:bg-zinc-800 text-zinc-900 dark:text-white shadow-sm" : "text-zinc-500 hover:text-zinc-700"}`}>
-                  <Sun size={16} />
-                </button>
-                <button onClick={() => setTheme("system")} className={`p-2 rounded-md transition-colors cursor-pointer ${theme === "system" ? "bg-white dark:bg-zinc-800 text-zinc-900 dark:text-white shadow-sm" : "text-zinc-500 hover:text-zinc-700"}`}>
-                  <Monitor size={16} />
-                </button>
-                <button onClick={() => setTheme("dark")} className={`p-2 rounded-md transition-colors cursor-pointer ${theme === "dark" ? "bg-white dark:bg-zinc-800 text-zinc-900 dark:text-white shadow-sm" : "text-zinc-500 hover:text-zinc-700"}`}>
-                  <Moon size={16} />
-                </button>
-              </div>
-            )}
-            <div className="[&_.wallet-adapter-button]:bg-purple-600 [&_.wallet-adapter-button]:hover:bg-purple-700 [&_.wallet-adapter-button]:rounded-lg [&_.wallet-adapter-button]:h-[44px] [&_.wallet-adapter-button]:font-bold [&_.wallet-adapter-button]:shadow-md">
-              <WalletMultiButton />
-            </div>
+          <div className="flex items-center gap-3">
+            <WalletMultiButton />
           </div>
         </header>
 
-        {/* SEO IMAGE INSERTION */}
-        <div className="mb-12 flex justify-center animate-in fade-in zoom-in duration-500">
-           <Image 
-              src="/images/solana-vanity-address-generator.jpg" // Updated to match your new filename
-              alt="SolanaKeys GPU Vanity Address Generator"
-              width={1200}
-              height={630}
-              className="rounded-2xl shadow-2xl border border-card-border max-w-full h-auto"
-              priority
-            />
-        </div>
+        {/* HERO SECTION: The "Hook" */}
+        <section className="mb-16 grid lg:grid-cols-2 gap-12 items-center">
+            <div className="space-y-6">
+                <h2 className="text-5xl font-black tracking-tight leading-tight">
+                    Own Your Address. <br />
+                    <span className="text-purple-500">Own Your Brand.</span>
+                </h2>
+                <p className="text-zinc-500 text-lg">
+                    Generate cryptographically secure, custom Solana vanity addresses at bare-metal speeds. Instant delivery, E2EE vault security, and zero-trust escrow.
+                </p>
+                <div className="flex gap-4 pt-4">
+                    <button onClick={() => setActiveTab("create")} className="bg-foreground text-background px-8 py-4 rounded-xl font-black flex items-center gap-2 hover:opacity-90 transition-opacity">
+                        Generate Now <ArrowRight size={18}/>
+                    </button>
+                </div>
+            </div>
+            <div className="relative animate-in fade-in zoom-in duration-700">
+                <Image 
+                    src="/images/solana-vanity-address-generator.jpg"
+                    alt="SolanaKeys GPU Vanity Address Generator"
+                    width={800}
+                    height={450}
+                    className="rounded-2xl shadow-[0_0_50px_-12px_rgba(168,85,247,0.3)] border border-card-border"
+                    priority
+                />
+            </div>
+        </section>
 
-        {/* NAVIGATION TABS */}
-        <div className="flex flex-wrap gap-3 mb-10">
-          {[
-            { id: "create", label: "Create Custom Address" },
-            { id: "marketplace", label: "Instant Storefront" },
-            { id: "exchange", label: "P2P Exchange" },
-            { id: "vault", label: "My Vault" },
-          ].map((tab) => (
-            <button 
-              key={tab.id} 
-              onClick={() => setActiveTab(tab.id as any)} 
-              className={`px-6 py-3 text-sm font-bold rounded-lg transition-all border cursor-pointer ${activeTab === tab.id ? "border-foreground bg-foreground text-background shadow-md" : "border-card-border bg-card text-zinc-600 dark:text-zinc-400 hover:border-zinc-400 dark:hover:border-zinc-600"}`}
-            >
-              {tab.label}
-            </button>
-          ))}
-        </div>
+        {/* NAVIGATION TABS: The "Bridge" */}
+        <nav className="sticky top-0 z-50 bg-background/80 backdrop-blur-md py-4 mb-8 -mx-4 px-4 sm:mx-0 sm:px-0">
+            <div className="flex flex-wrap gap-2 p-1 bg-card border border-card-border rounded-xl">
+            {[
+                { id: "create", label: "Generator" },
+                { id: "marketplace", label: "Storefront" },
+                { id: "exchange", label: "P2P Exchange" },
+                { id: "vault", label: "My Vault" },
+            ].map((tab) => (
+                <button 
+                key={tab.id} 
+                onClick={() => setActiveTab(tab.id as any)} 
+                className={`flex-1 px-4 py-3 text-sm font-black rounded-lg transition-all cursor-pointer ${activeTab === tab.id ? "bg-foreground text-background shadow-md" : "text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800"}`}
+                >
+                {tab.label}
+                </button>
+            ))}
+            </div>
+        </nav>
 
-        {/* ISOLATED VIEW ROUTING */}
-        <main className="relative">
+        {/* CONTENT */}
+        <main className="min-h-[500px]">
           {activeTab === "create" && <GeneratorView onJobQueued={() => setActiveTab("vault")} />}
           {activeTab === "marketplace" && <MarketplaceView />}
           {activeTab === "exchange" && <ExchangeView />}
@@ -99,10 +97,8 @@ export default function Home() {
         </main>
       </div>
 
-      <footer className="border-t border-card-border mt-16 bg-card/50">
-        <div className="max-w-7xl mx-auto px-4 py-8 text-center text-sm text-zinc-500 font-medium">
-          © {new Date().getFullYear()} SolanaKeys. Providing secure, hardware-generated vanity addresses.
-        </div>
+      <footer className="border-t border-card-border mt-20 py-12 text-center text-sm text-zinc-500">
+        © {new Date().getFullYear()} SolanaKeys. Secure hardware-generated assets.
       </footer>
     </div>
   );
